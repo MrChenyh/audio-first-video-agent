@@ -1,0 +1,415 @@
+:root {
+  color: #1e2528;
+  background: #eef2ef;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 28px;
+}
+
+.workspace {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  align-items: center;
+  margin-bottom: 22px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: #5a6b62;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0;
+  font-size: clamp(1.9rem, 4vw, 3rem);
+  letter-spacing: 0;
+}
+
+h2 {
+  margin-bottom: 0;
+  font-size: 1rem;
+}
+
+h3 {
+  margin-bottom: 6px;
+  font-size: 0.95rem;
+}
+
+.status-pill,
+.primary-action,
+.progress-header,
+.section-title,
+.stage,
+.error-line,
+.mock-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-pill {
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid #cbd7d0;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #33413a;
+}
+
+.main-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) 1fr;
+  gap: 18px;
+}
+
+.upload-panel,
+.progress-panel,
+.answer-band,
+.timeline-band,
+.frames-band,
+.checks-band {
+  border: 1px solid #d7ded9;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 18px;
+}
+
+.drop-zone {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 160px;
+  gap: 10px;
+  border: 1px dashed #879990;
+  border-radius: 8px;
+  color: #42524b;
+  text-align: center;
+  cursor: pointer;
+}
+
+.drop-zone input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.question-box {
+  display: block;
+  margin-top: 16px;
+}
+
+.question-box > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 8px;
+  color: #405049;
+  font-weight: 650;
+}
+
+textarea {
+  width: 100%;
+  min-height: 132px;
+  resize: vertical;
+  border: 1px solid #cbd7d0;
+  border-radius: 8px;
+  padding: 12px;
+  color: #1d2924;
+}
+
+.primary-action {
+  width: 100%;
+  justify-content: center;
+  min-height: 44px;
+  margin-top: 14px;
+  border: 0;
+  border-radius: 8px;
+  background: #126b57;
+  color: #ffffff;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.primary-action:disabled {
+  cursor: not-allowed;
+  background: #9aa9a2;
+}
+
+.progress-panel {
+  min-height: 260px;
+}
+
+.progress-header {
+  justify-content: space-between;
+  width: 100%;
+  margin-bottom: 10px;
+  font-size: 1.5rem;
+  font-weight: 750;
+}
+
+.progress-track {
+  height: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e4ebe6;
+}
+
+.progress-track div {
+  height: 100%;
+  border-radius: 999px;
+  background: #126b57;
+  transition: width 240ms ease;
+}
+
+.stage-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.stage {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d7ded9;
+  border-radius: 8px;
+  color: #66736d;
+}
+
+.stage.active {
+  border-color: #126b57;
+  color: #126b57;
+  background: #eef8f4;
+}
+
+.error-line,
+.mock-line,
+.audio-status {
+  width: 100%;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border-radius: 8px;
+}
+
+.error-line {
+  background: #fff1ee;
+  color: #9d2d1e;
+}
+
+.mock-line {
+  background: #fff7df;
+  color: #7b5511;
+}
+
+.audio-status {
+  display: grid;
+  gap: 4px;
+  margin-top: 0;
+  margin-bottom: 12px;
+  background: #eef6ff;
+  color: #244967;
+}
+
+.result-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.answer-band {
+  grid-column: 1 / -1;
+}
+
+.section-title {
+  margin-bottom: 14px;
+  color: #2b3b35;
+}
+
+.section-title.compact {
+  margin-bottom: 8px;
+}
+
+.direct-answer {
+  font-size: 1.15rem;
+  font-weight: 680;
+  color: #15251f;
+}
+
+.timeline,
+.check-list,
+.transcript-list {
+  display: grid;
+  gap: 10px;
+}
+
+.timeline-item,
+.check-row,
+.transcript-row {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid #e0e6e2;
+  border-radius: 8px;
+}
+
+.time {
+  display: inline-grid;
+  place-items: center;
+  min-height: 30px;
+  border-radius: 6px;
+  background: #e8f3ef;
+  color: #126b57;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+small {
+  color: #65736d;
+}
+
+.frame-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 12px;
+}
+
+.frame-card {
+  overflow: hidden;
+  border: 1px solid #e0e6e2;
+  border-radius: 8px;
+  background: #fbfcfb;
+}
+
+.frame-card img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: #d9e1dc;
+}
+
+.frame-card div {
+  padding: 12px;
+}
+
+.frame-card p {
+  overflow-wrap: anywhere;
+}
+
+.target-text {
+  margin-bottom: 8px;
+  color: #23483d;
+  font-weight: 680;
+  line-height: 1.45;
+}
+
+.align {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.align.match {
+  background: #e7f7e7;
+  color: #20723a;
+}
+
+.align.conflict {
+  background: #ffe9e3;
+  color: #a03a22;
+}
+
+.align.uncertain {
+  background: #fff3d6;
+  color: #805d12;
+}
+
+.check-row {
+  grid-template-columns: 86px 1fr;
+}
+
+.transcript-list {
+  margin-bottom: 14px;
+}
+
+.transcript-row p {
+  margin-bottom: 0;
+}
+
+.empty {
+  color: #65736d;
+}
+
+.spin {
+  animation: spin 800ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 880px) {
+  .app-shell {
+    padding: 16px;
+  }
+
+  .topbar,
+  .main-grid,
+  .result-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    display: grid;
+  }
+
+  .timeline-item,
+  .check-row {
+    grid-template-columns: 1fr;
+  }
+}

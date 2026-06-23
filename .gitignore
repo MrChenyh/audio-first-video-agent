@@ -1,0 +1,31 @@
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+.coverage
+htmlcov/
+
+# Node / Vite
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
