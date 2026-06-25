@@ -75,7 +75,11 @@ h3 {
 .section-title,
 .stage,
 .error-line,
-.mock-line {
+.mock-line,
+.source-tabs,
+.source-tabs button,
+.metric-row,
+.followup-form {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -101,11 +105,39 @@ h3 {
 .answer-band,
 .timeline-band,
 .frames-band,
-.checks-band {
+.coverage-band,
+.chat-band {
   border: 1px solid #d7ded9;
   border-radius: 8px;
   background: #ffffff;
   padding: 18px;
+}
+
+.source-tabs {
+  width: 100%;
+  margin-bottom: 14px;
+  padding: 4px;
+  border: 1px solid #d7ded9;
+  border-radius: 8px;
+  background: #f6f8f6;
+}
+
+.source-tabs button {
+  flex: 1;
+  justify-content: center;
+  min-height: 38px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #596962;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.source-tabs button.active {
+  background: #ffffff;
+  color: #126b57;
+  box-shadow: 0 1px 5px rgba(18, 107, 87, 0.12);
 }
 
 .drop-zone {
@@ -133,13 +165,33 @@ h3 {
   margin-top: 16px;
 }
 
-.question-box > span {
+.question-box > span,
+.url-box > span {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   margin-bottom: 8px;
   color: #405049;
   font-weight: 650;
+}
+
+.url-box {
+  display: block;
+}
+
+.url-box input,
+.followup-form input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid #cbd7d0;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #1d2924;
+}
+
+.url-box small {
+  display: block;
+  margin-top: 8px;
 }
 
 textarea {
@@ -217,6 +269,15 @@ textarea {
   background: #eef8f4;
 }
 
+.source-preview {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  margin-top: 18px;
+  border-radius: 8px;
+  background: #111a17;
+}
+
 .error-line,
 .mock-line,
 .audio-status {
@@ -256,6 +317,10 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.chat-band {
+  grid-column: 1 / -1;
+}
+
 .section-title {
   margin-bottom: 14px;
   color: #2b3b35;
@@ -271,15 +336,31 @@ textarea {
   color: #15251f;
 }
 
+.metric-row {
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.metric-row span {
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 6px;
+  background: #eef3ef;
+  color: #405049;
+  font-size: 0.82rem;
+  font-weight: 680;
+}
+
 .timeline,
-.check-list,
-.transcript-list {
+.coverage-list,
+.transcript-list,
+.chat-list {
   display: grid;
   gap: 10px;
 }
 
 .timeline-item,
-.check-row,
+.coverage-row,
 .transcript-row {
   display: grid;
   grid-template-columns: 58px 1fr;
@@ -299,6 +380,12 @@ textarea {
   color: #126b57;
   font-size: 0.85rem;
   font-weight: 700;
+}
+
+.compact-scroll {
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 4px;
 }
 
 small {
@@ -341,7 +428,7 @@ small {
   line-height: 1.45;
 }
 
-.align {
+.evidence-pill {
   display: inline-flex;
   align-items: center;
   min-height: 24px;
@@ -352,23 +439,23 @@ small {
   text-transform: uppercase;
 }
 
-.align.match {
+.evidence-pill.observed {
   background: #e7f7e7;
   color: #20723a;
 }
 
-.align.conflict {
-  background: #ffe9e3;
-  color: #a03a22;
-}
-
-.align.uncertain {
+.evidence-pill.pending {
   background: #fff3d6;
   color: #805d12;
 }
 
-.check-row {
+.coverage-row {
   grid-template-columns: 86px 1fr;
+}
+
+.coverage-note {
+  margin: 12px 0 0;
+  color: #65736d;
 }
 
 .transcript-list {
@@ -381,6 +468,57 @@ small {
 
 .empty {
   color: #65736d;
+}
+
+.chat-list {
+  margin-bottom: 12px;
+}
+
+.chat-message {
+  max-width: min(820px, 100%);
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #f4f7f5;
+}
+
+.chat-message.user {
+  justify-self: end;
+  background: #e8f3ef;
+}
+
+.chat-message.assistant {
+  justify-self: start;
+  border: 1px solid #dfe8e3;
+}
+
+.chat-message p {
+  margin-bottom: 4px;
+}
+
+.chat-message small {
+  display: block;
+  margin-top: 6px;
+}
+
+.followup-form {
+  width: 100%;
+}
+
+.followup-form button {
+  display: inline-grid;
+  place-items: center;
+  min-width: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: #126b57;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.followup-form button:disabled {
+  cursor: not-allowed;
+  background: #9aa9a2;
 }
 
 .spin {
@@ -409,7 +547,12 @@ small {
   }
 
   .timeline-item,
-  .check-row {
+  .coverage-row {
     grid-template-columns: 1fr;
+  }
+
+  .metric-row,
+  .followup-form {
+    display: grid;
   }
 }

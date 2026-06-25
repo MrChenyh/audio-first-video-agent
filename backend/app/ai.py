@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ class AIClient:
         self.mock = settings.use_mock_models
         self._client = None
         self.last_transcription_status: dict[str, Any] = {}
+        self.last_vision_request_count = 0
         if not self.mock:
             from openai import OpenAI
 
@@ -66,8 +68,26 @@ class AIClient:
                 },
             ]
 
-        assert self._client is not None
         attempts: list[dict[str, Any]] = []
+        if self.settings.local_transcribe_first:
+            local_segments, local_status = self._local_transcribe(audio_path)
+            attempts.append(local_status)
+            if local_segments:
+                self.last_transcription_status = {
+                    "status": "ok",
+                    "reason": "Local faster-whisper was configured as the primary transcription path.",
+                    "method": "local_faster_whisper",
+                    "api_attempted": False,
+                    "chat_audio_attempted": False,
+                    "local_attempted": True,
+                    "attempts": attempts,
+                    "segment_count": len(local_segments),
+                }
+                return local_segments
+            if not self.settings.allow_model_fallback:
+                raise RuntimeError(local_status.get("error") or "Local transcription returned no text.")
+
+        assert self._client is not None
         if self.settings.audio_chat_transcribe_model:
             chat_segments = self._chat_audio_transcribe(audio_path, duration, attempts)
             if chat_segments:
@@ -175,6 +195,8 @@ class AIClient:
         duration: float,
         has_audio: bool,
     ) -> dict[str, Any]:
+        if self.settings.fast_mode:
+            return self._fast_audio_world_model(question, transcript_segments, duration, has_audio)
         if self.mock:
             if not has_audio or not transcript_segments:
                 return {
@@ -257,7 +279,9 @@ class AIClient:
         frames: list[dict[str, Any]],
         audio_world_model: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        self.last_vision_request_count = 0
         if self.mock:
+            self.last_vision_request_count = 1 if frames else 0
             timeline = audio_world_model.get("timeline") or []
             observations = []
             for frame in frames:
@@ -277,6 +301,22 @@ class AIClient:
                     }
                 )
             return observations
+
+        if self.settings.vision_provider in {"joyai", "joyai_adapter", "auto"}:
+            try:
+                observations = self._observe_frames_with_joyai(
+                    question=question,
+                    frames=frames,
+                    audio_world_model=audio_world_model,
+                )
+                self.last_vision_request_count = len(frames)
+                return observations
+            except Exception:
+                if not self.settings.allow_model_fallback:
+                    raise
+                if self.settings.vision_provider in {"joyai", "joyai_adapter"}:
+                    self.last_vision_request_count = len(frames)
+                    return self._fallback_frame_observations(frames, "JoyAI local vision endpoint failed.")
 
         observations: list[dict[str, Any]] = []
         schema = {
@@ -345,24 +385,16 @@ class AIClient:
                 "frame_observations",
                 images=images,
             )
+            self.last_vision_request_count = 1 if frames else 0
             raw_observations = payload.get("observations", [])
         except Exception:
             if not self.settings.allow_model_fallback:
                 raise
-            raw_observations = [
-                {
-                    "filename": frame["filename"],
-                    "scene": "Frame extracted successfully, but the configured model endpoint could not inspect images.",
-                    "objects": [],
-                    "actions": [],
-                    "visible_text": [],
-                    "audio_alignment": "uncertain",
-                    "visual_target": str((frame.get("probe") or {}).get("question") or frame.get("reason", "")),
-                    "evidence_assessment": "The image endpoint could not inspect this frame.",
-                    "notes": "Model fallback observation.",
-                }
-                for frame in frames
-            ]
+            self.last_vision_request_count = 1 if frames else 0
+            raw_observations = self._fallback_frame_observations(
+                frames,
+                "The configured model endpoint could not inspect images.",
+            )
 
         by_filename = {
             str(item.get("filename") or ""): item
@@ -388,6 +420,140 @@ class AIClient:
             observations.append(payload)
         return observations
 
+    def _observe_frames_with_joyai(
+        self,
+        *,
+        question: str,
+        frames: list[dict[str, Any]],
+        audio_world_model: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key=self.settings.joyai_api_key,
+            base_url=self.settings.joyai_api_base,
+            timeout=self.settings.joyai_timeout_seconds,
+            max_retries=0,
+        )
+        observations: list[dict[str, Any]] = []
+        for index, frame in enumerate(frames):
+            target = str((frame.get("probe") or {}).get("question") or frame.get("reason") or question)
+            audio_context = self._audio_context_for_time(audio_world_model, float(frame["time"]))
+            session_id = f"audio-first-{int(time.time() * 1000)}-{index}"
+            prompt = (
+                "You are the fast local visual verifier inside an audio-first video agent. "
+                "Do not give a generic caption. Verify the audio-guided target for the current frame. "
+                "This is image QA, not passive live monitoring. You must not output </silence>. "
+                "Always answer with </response> followed by concise Chinese visible evidence. Include visible objects, "
+                "actions, text/symbols, and whether the frame matches, conflicts with, or is uncertain for the target.\n"
+                f"User question: {question}\n"
+                f"Frame time: {float(frame['time']):.2f}s\n"
+                f"Audio context near this frame: {audio_context}\n"
+                f"Visual target to verify: {target}"
+            )
+            response = client.chat.completions.create(
+                model=self.settings.joyai_model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": self._image_data_url(Path(frame["path"]))},
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=96,
+                temperature=0,
+                extra_headers={
+                    "x-streaming-session": session_id,
+                    "x-frame-time-range": f"{float(frame['time']):.2f}s-{float(frame['time']) + 1.0:.2f}s",
+                },
+            )
+            raw_text = response.choices[0].message.content if response.choices else ""
+            observations.append(self._joyai_text_to_observation(frame, target, audio_context, raw_text or ""))
+        return observations
+
+    def _fallback_frame_observations(self, frames: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "filename": frame["filename"],
+                "time": frame["time"],
+                "scene": "Frame extracted successfully, but the vision endpoint could not inspect pixels.",
+                "objects": [],
+                "actions": [],
+                "visible_text": [],
+                "audio_alignment": "uncertain",
+                "visual_target": str((frame.get("probe") or {}).get("question") or frame.get("reason", "")),
+                "evidence_assessment": reason,
+                "notes": "Model fallback observation.",
+            }
+            for frame in frames
+        ]
+
+    @staticmethod
+    def _audio_context_for_time(audio_world_model: dict[str, Any], frame_time: float) -> str:
+        timeline = audio_world_model.get("timeline") or []
+        if not timeline:
+            return "No audio timeline event was available."
+        scored = sorted(
+            timeline,
+            key=lambda item: abs(float(item.get("time", 0.0)) - frame_time),
+        )
+        nearby = []
+        for item in scored[:2]:
+            nearby.append(
+                {
+                    "time": item.get("time"),
+                    "end_time": item.get("end_time"),
+                    "label": item.get("label"),
+                    "evidence": item.get("evidence"),
+                    "expected_visuals": item.get("expected_visuals", []),
+                    "visual_question": item.get("visual_question", ""),
+                }
+            )
+        return json.dumps(nearby, ensure_ascii=False)
+
+    @staticmethod
+    def _joyai_text_to_observation(
+        frame: dict[str, Any],
+        target: str,
+        audio_context: str,
+        raw_text: str,
+    ) -> dict[str, Any]:
+        text = raw_text.strip()
+        if text.startswith("</response>"):
+            text = text.removeprefix("</response>").strip()
+        if not text or raw_text.strip() == "</silence>":
+            text = "JoyAI returned silence for this frame."
+        lower = text.lower()
+        visible_text = []
+        for marker in ("囍", "喜", "double happiness", "red cloth", "veil", "盖头", "红布", "红色"):
+            if marker.lower() in lower or marker in text:
+                visible_text.append(marker)
+        match_terms = ("match", "matches", "support", "supports", "一致", "符合", "支持", "出现", "可见")
+        conflict_terms = ("conflict", "contradict", "不一致", "冲突", "没有", "未见", "看不到")
+        if any(term in lower or term in text for term in conflict_terms):
+            alignment = "conflict"
+        elif any(term in lower or term in text for term in match_terms):
+            alignment = "match"
+        else:
+            alignment = "uncertain"
+        return {
+            "time": frame["time"],
+            "filename": frame["filename"],
+            "visual_target": target,
+            "evidence_assessment": text,
+            "scene": text,
+            "objects": [],
+            "actions": [],
+            "visible_text": sorted(set(visible_text)),
+            "audio_alignment": alignment,
+            "notes": f"vision_provider=joyai; audio_context={audio_context}",
+        }
+
     def predict_next_events(
         self,
         *,
@@ -395,6 +561,8 @@ class AIClient:
         observations: list[dict[str, Any]],
         duration: float,
     ) -> list[dict[str, Any]]:
+        if self.settings.fast_mode:
+            return self._fast_predictions(audio_world_model, observations, duration)
         if self.mock:
             timeline = audio_world_model.get("timeline") or []
             seeds = timeline[:3] if timeline else [{"time": 0, "label": "visual context"}]
@@ -457,6 +625,11 @@ class AIClient:
         predictions: list[dict[str, Any]],
         observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        if self.settings.fast_mode:
+            return self._enrich_prediction_checks(
+                [classify_prediction_check(prediction, observations) for prediction in predictions],
+                predictions,
+            )
         if self.mock:
             return self._enrich_prediction_checks(
                 [classify_prediction_check(prediction, observations) for prediction in predictions],
@@ -518,6 +691,8 @@ class AIClient:
         observations: list[dict[str, Any]],
         checks: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        if self.settings.fast_mode:
+            return self._fast_answer(question, audio_world_model, observations, checks)
         if self.mock:
             evidence_refs = [
                 f"{obs['time']:.2f}s: {obs.get('scene', 'visual observation')}"
@@ -561,6 +736,41 @@ class AIClient:
                 return self._fallback_answer(question, audio_world_model, observations, checks)
             raise
 
+    def answer_followup(self, *, question: str, result: dict[str, Any]) -> dict[str, Any]:
+        if self.mock or self.settings.fast_mode:
+            return self._local_followup_answer(question, result)
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer": {"type": "string"},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                "coverage_note": {"type": "string"},
+            },
+            "required": ["answer", "evidence_refs", "coverage_note"],
+        }
+        context = {
+            "original_question": result.get("question"),
+            "answer": result.get("answer"),
+            "timeline": (result.get("timeline") or [])[:24],
+            "transcript_segments": (result.get("transcript_segments") or [])[:80],
+            "frames": self._compact_frames_for_prompt(result.get("frames") or []),
+            "metadata": result.get("metadata") or {},
+        }
+        prompt = (
+            "Answer this follow-up question in Chinese using only the already extracted transcript and key-frame "
+            "evidence from a previous video analysis. Do not invent unseen content. If the evidence does not cover "
+            "the requested moment, say which time range would need more frames. Keep the answer concise.\n\n"
+            f"Follow-up question: {question}\n"
+            f"Analysis context: {json.dumps(context, ensure_ascii=False)}"
+        )
+        try:
+            return self._responses_json(self.settings.reasoning_model, prompt, schema, "followup_answer")
+        except Exception:
+            if self.settings.allow_model_fallback:
+                return self._local_followup_answer(question, result)
+            raise
+
     def _fallback_audio_world_model(self, question: str, transcript_segments: list[dict[str, Any]]) -> dict[str, Any]:
         if not transcript_segments:
             return {
@@ -590,6 +800,148 @@ class AIClient:
             "open_questions": [question],
         }
 
+    def _fast_audio_world_model(
+        self,
+        question: str,
+        transcript_segments: list[dict[str, Any]],
+        duration: float,
+        has_audio: bool,
+    ) -> dict[str, Any]:
+        if not has_audio or not transcript_segments:
+            return {
+                "summary": "快速模式：没有可用音频转写，改用稀疏视觉采样。",
+                "actors": [],
+                "environment_hypotheses": [],
+                "mood": "unknown",
+                "timeline": [],
+                "open_questions": [question],
+                "mode": "fast",
+            }
+        selected_segments = self._select_fast_timeline_segments(transcript_segments, duration)
+        timeline = []
+        for index, segment in enumerate(selected_segments):
+            text = str(segment.get("text", "")).strip()
+            start = float(segment.get("start") or 0.0)
+            end = float(segment.get("end") or min(duration, start + 1.5))
+            expected = self._fast_expected_visuals(text)
+            timeline.append(
+                {
+                    "time": start,
+                    "end_time": end,
+                    "label": self._fast_event_label(text, index),
+                    "evidence": text,
+                    "expected_visuals": expected,
+                    "visual_question": f"画面是否能支持这段音频：{text[:80]}？重点检查：{', '.join(expected[:4]) or '人物、场景、动作'}。",
+                }
+            )
+        return {
+            "summary": "快速模式：直接把音频转写切成可验证事件，跳过大模型音频世界建模。",
+            "actors": sorted({str(segment.get("speaker") or "unknown") for segment in transcript_segments}),
+            "environment_hypotheses": [],
+            "mood": "unknown",
+            "timeline": timeline,
+            "open_questions": [question],
+            "mode": "fast",
+            "source_segment_count": len(transcript_segments),
+            "selected_segment_count": len(selected_segments),
+        }
+
+    def _select_fast_timeline_segments(
+        self,
+        transcript_segments: list[dict[str, Any]],
+        duration: float,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, self.settings.fast_max_timeline_events)
+        if len(transcript_segments) <= limit:
+            return transcript_segments
+        scored = []
+        for index, segment in enumerate(transcript_segments):
+            text = str(segment.get("text", ""))
+            start = float(segment.get("start") or 0.0)
+            score = self._fast_segment_score(text)
+            scored.append((score, start, index, segment))
+        selected: dict[int, dict[str, Any]] = {}
+        for _, _, index, segment in sorted(scored, key=lambda item: (-item[0], item[1]))[: max(1, limit // 2)]:
+            selected[index] = segment
+        coverage_slots = max(1, limit - len(selected))
+        for slot in range(coverage_slots):
+            target = (duration * (slot + 0.5)) / coverage_slots if duration > 0 else 0.0
+            _, _, index, segment = min(
+                scored,
+                key=lambda item: (abs(item[1] - target), item[2] in selected),
+            )
+            selected[index] = segment
+        if len(selected) < limit:
+            for _, _, index, segment in sorted(scored, key=lambda item: item[1]):
+                selected.setdefault(index, segment)
+                if len(selected) >= limit:
+                    break
+        return [selected[index] for index in sorted(selected)]
+
+    @staticmethod
+    def _fast_segment_score(text: str) -> int:
+        groups = [
+            ("结构", ("首先", "然后", "接着", "最后", "总结", "开始", "完成", "过程", "阶段")),
+            ("3d", ("3D", "打印", "模型", "建模", "材料", "设备", "机器", "施工")),
+            ("装修", ("装修", "房子", "墙", "地面", "家具", "安装", "设计", "效果")),
+            ("问题", ("问题", "失败", "困难", "挑战", "测试", "改进", "成本", "时间")),
+        ]
+        score = 0
+        for weight, (_, keywords) in enumerate(groups, start=2):
+            score += weight * sum(1 for keyword in keywords if keyword.lower() in text.lower() or keyword in text)
+        return score
+
+    @staticmethod
+    def _fast_event_label(text: str, index: int) -> str:
+        if any(token in text for token in ("建模", "模型", "设计", "图纸", "方案")):
+            return "设计建模线索"
+        if any(token in text for token in ("3D", "打印", "打印机", "机器", "设备", "喷嘴")):
+            return "3D 打印过程线索"
+        if any(token in text for token in ("材料", "水泥", "砂浆", "混凝土", "耗材", "配比")):
+            return "打印材料线索"
+        if any(token in text for token in ("装修", "施工", "墙", "地面", "地板", "吊顶", "安装", "打磨")):
+            return "装修施工线索"
+        if any(token in text for token in ("房子", "房间", "客厅", "卧室", "厨房", "卫生间", "整套")):
+            return "空间成果线索"
+        if any(token in text for token in ("成本", "价格", "预算", "时间", "天", "效率")):
+            return "成本进度线索"
+        if any(token in text for token in ("狐狸", "白狐", "狐")):
+            return "白狐身份线索"
+        if any(token in text for token in ("夫妻", "夫妇", "成婚", "结婚", "嫁")):
+            return "婚姻关系线索"
+        if any(token in text for token in ("山林", "森林", "生活", "幸福")):
+            return "结尾生活线索"
+        if any(token in text for token in ("雪山", "救")):
+            return "过去救助线索"
+        return f"音频事件 {index + 1}"
+
+    @staticmethod
+    def _fast_expected_visuals(text: str) -> list[str]:
+        expected: list[str] = []
+        mapping = [
+            (("建模", "模型", "设计", "图纸", "方案"), ["电脑建模界面", "设计图", "房屋模型", "尺寸标注"]),
+            (("3D", "打印", "打印机", "机器", "设备", "喷嘴"), ["3D 打印设备", "打印喷头", "层层堆叠的材料", "机器运动"]),
+            (("材料", "水泥", "砂浆", "混凝土", "耗材", "配比"), ["材料桶", "水泥砂浆", "混合设备", "材料纹理"]),
+            (("装修", "施工", "墙", "地面", "地板", "吊顶", "安装", "打磨"), ["施工现场", "墙面", "地面", "安装工具", "工人操作"]),
+            (("房子", "房间", "客厅", "卧室", "厨房", "卫生间", "整套"), ["房间全景", "装修成品", "家具", "空间布局"]),
+            (("成本", "价格", "预算", "时间", "天", "效率"), ["价格表或字幕", "进度画面", "前后对比", "成果展示"]),
+            (("狐狸", "白狐", "狐"), ["白衣女子", "身份揭示", "人物表情"]),
+            (("夫妻", "夫妇", "成婚", "结婚", "嫁"), ["红布", "囍字", "红盖头", "男女同框", "婚礼布置"]),
+            (("山林", "森林", "生活", "幸福"), ["树林", "木屋", "两人相伴", "生活场景"]),
+            (("雪山", "救"), ["雪山", "救助动作", "回忆画面"]),
+            (("你", "我", "是"), ["对话人物", "回应动作", "表情变化"]),
+        ]
+        for keywords, visuals in mapping:
+            if any(keyword in text for keyword in keywords):
+                expected.extend(visuals)
+        if not expected:
+            expected.extend(["人物", "场景", "动作"])
+        deduped = []
+        for item in expected:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped
+
     def _fallback_predictions(self, observations: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
         seeds = observations[:3] or [{"time": 0.0, "scene": "sampled context"}]
         predictions = []
@@ -604,6 +956,30 @@ class AIClient:
                     "source_event": str(observation.get("visual_target") or observation.get("scene", "sampled context")),
                 }
             )
+        return predictions
+
+    def _fast_predictions(
+        self,
+        audio_world_model: dict[str, Any],
+        observations: list[dict[str, Any]],
+        duration: float,
+    ) -> list[dict[str, Any]]:
+        predictions = []
+        timeline = audio_world_model.get("timeline") or []
+        if timeline:
+            for event in timeline[-3:]:
+                start = min(duration, float(event.get("end_time") or event.get("time") or 0.0))
+                predictions.append(
+                    {
+                        "window_start": start,
+                        "window_end": min(duration, start + 2.0),
+                        "hypothesis": f"后续画面应继续支持：{event.get('label', '音频事件')}",
+                        "expected_evidence": [str(item) for item in event.get("expected_visuals", [])],
+                        "source_event": str(event.get("label") or "audio event"),
+                    }
+                )
+        if not predictions:
+            return self._fallback_predictions(observations, duration)
         return predictions
 
     @staticmethod
@@ -648,6 +1024,168 @@ class AIClient:
                 "Use an OpenAI-compatible endpoint with audio transcription and image input for full results.",
             ],
         }
+
+    @staticmethod
+    def _fast_answer(
+        question: str,
+        audio_world_model: dict[str, Any],
+        observations: list[dict[str, Any]],
+        checks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        timeline = audio_world_model.get("timeline") or []
+        transcript_events = [
+            item
+            for item in timeline
+            if str(item.get("evidence", "")).strip() or str(item.get("label", "")).strip()
+        ]
+        transcript_bits = [str(item.get("evidence", "")).strip() for item in transcript_events if str(item.get("evidence", "")).strip()]
+        visual_bits = [
+            f"{float(obs.get('time', 0.0)):.2f}s：{obs.get('evidence_assessment') or obs.get('scene', '')}"
+            for obs in observations
+            if str(obs.get("evidence_assessment") or obs.get("scene", "")).strip()
+        ]
+        coverage_note = []
+        duration = float((audio_world_model.get("duration") or 0.0) or 0.0)
+        if duration <= 0 and timeline:
+            duration = max(float(item.get("end_time") or item.get("time") or 0.0) for item in timeline)
+        if timeline and observations:
+            observed_times = [float(obs.get("time", 0.0)) for obs in observations]
+            uncovered = []
+            for event in transcript_events:
+                event_time = float(event.get("time") or 0.0)
+                if min(abs(time - event_time) for time in observed_times) > 90:
+                    uncovered.append(f"{AIClient._format_seconds(event_time)} {event.get('label', '音频事件')}")
+            if uncovered:
+                coverage_note.append("仍可继续加密观察：" + "；".join(uncovered[:4]))
+        if not coverage_note:
+            coverage_note.append("当前总结基于音频时间线和已抽取关键画面，未展示内部预测检查。")
+
+        title = AIClient._infer_fast_topic(transcript_bits, visual_bits, question)
+        direct = f"视频主要围绕{title}展开。"
+        if transcript_bits:
+            direct += " 核心线索是：" + "；".join(AIClient._compress_text(bit, 42) for bit in transcript_bits[:3])
+        if len(direct) > 180:
+            direct = direct[:177] + "..."
+        summary_parts = []
+        if transcript_events:
+            event_lines = []
+            for event in transcript_events[:8]:
+                event_lines.append(
+                    f"{AIClient._format_seconds(float(event.get('time') or 0.0))} {event.get('label', '音频事件')}："
+                    f"{AIClient._compress_text(str(event.get('evidence') or ''), 58)}"
+                )
+            summary_parts.append("大致过程：" + "；".join(event_lines) + "。")
+        if visual_bits:
+            summary_parts.append("关键画面证据：" + "；".join(AIClient._compress_text(bit, 72) for bit in visual_bits[:8]) + "。")
+        summary_parts.append("覆盖说明：" + "；".join(coverage_note) + "。")
+        return {
+            "direct_answer": direct or f"快速模式已处理问题：{question}",
+            "summary": "".join(summary_parts)[:900],
+            "evidence_refs": (visual_bits[:6] + [f"音频：{bit}" for bit in transcript_bits[:4]])[:8],
+            "uncertainties": coverage_note,
+        }
+
+    @staticmethod
+    def _compact_frames_for_prompt(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compact = []
+        for frame in frames[:24]:
+            observation = frame.get("observation") or {}
+            compact.append(
+                {
+                    "time": frame.get("time"),
+                    "reason": frame.get("reason"),
+                    "scene": observation.get("scene"),
+                    "evidence_assessment": observation.get("evidence_assessment"),
+                    "visible_text": observation.get("visible_text", []),
+                }
+            )
+        return compact
+
+    @staticmethod
+    def _local_followup_answer(question: str, result: dict[str, Any]) -> dict[str, Any]:
+        query_terms = AIClient._keywords(question)
+        timeline = result.get("timeline") or []
+        transcripts = result.get("transcript_segments") or []
+        frames = result.get("frames") or []
+
+        scored_events = []
+        for item in timeline:
+            text = " ".join([str(item.get("label", "")), str(item.get("evidence", ""))])
+            score = AIClient._overlap_score(query_terms, text)
+            if score:
+                scored_events.append((score, float(item.get("time") or 0.0), text))
+        scored_transcripts = []
+        for item in transcripts:
+            text = str(item.get("text", ""))
+            score = AIClient._overlap_score(query_terms, text)
+            if score:
+                scored_transcripts.append((score, float(item.get("start") or 0.0), text))
+        scored_frames = []
+        for frame in frames:
+            observation = frame.get("observation") or {}
+            text = " ".join(
+                [
+                    str(observation.get("visual_target", "")),
+                    str(observation.get("evidence_assessment", "")),
+                    str(observation.get("scene", "")),
+                    str(frame.get("reason", "")),
+                ]
+            )
+            score = AIClient._overlap_score(query_terms, text)
+            if score:
+                scored_frames.append((score, float(frame.get("time") or 0.0), text))
+
+        selected = sorted(scored_events + scored_transcripts + scored_frames, key=lambda item: (-item[0], item[1]))[:6]
+        if not selected:
+            base_answer = (result.get("answer") or {}).get("direct_answer") or "当前结果里没有命中这个追问的明确证据。"
+            return {
+                "answer": f"基于已分析内容：{base_answer}",
+                "evidence_refs": [],
+                "coverage_note": "这个追问没有命中已抽取的音频片段或关键画面，建议对相关时间段加密抽帧。",
+            }
+        evidence_refs = [f"{AIClient._format_seconds(time)}：{AIClient._compress_text(text, 88)}" for _, time, text in selected]
+        answer = "我在已分析证据里找到这些相关线索：" + "；".join(evidence_refs[:4]) + "。"
+        return {
+            "answer": answer[:520],
+            "evidence_refs": evidence_refs[:6],
+            "coverage_note": "这是基于当前已抽取音频和关键画面的追问回答；没有重新读取更多视频帧。",
+        }
+
+    @staticmethod
+    def _keywords(text: str) -> list[str]:
+        import re
+
+        words = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text)
+        stop = {"这个", "视频", "什么", "怎么", "如何", "一下", "主要", "是否", "有没有", "为什么", "哪里"}
+        return [word.lower() for word in words if word and word not in stop]
+
+    @staticmethod
+    def _overlap_score(query_terms: list[str], text: str) -> int:
+        lowered = text.lower()
+        return sum(1 for term in query_terms if term in lowered or term in text)
+
+    @staticmethod
+    def _compress_text(text: str, limit: int) -> str:
+        text = " ".join(str(text).split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)] + "..."
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        safe = max(0, int(round(seconds)))
+        return f"{safe // 60}:{safe % 60:02d}"
+
+    @staticmethod
+    def _infer_fast_topic(transcript_bits: list[str], visual_bits: list[str], question: str) -> str:
+        text = " ".join(transcript_bits + visual_bits + [question])
+        if any(token in text for token in ("3D", "打印", "装修", "房子", "施工")):
+            return "用 3D 打印和施工流程完成房屋装修"
+        if any(token in text for token in ("教程", "步骤", "演示", "安装")):
+            return "一个带步骤演示的教程内容"
+        if any(token in text for token in ("故事", "夫妻", "狐狸", "结局")):
+            return "一段带人物关系推进的故事"
+        return "音频叙述中的事件和对应关键画面"
 
     def _normalize_transcript(self, response: Any) -> list[dict[str, Any]]:
         payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)

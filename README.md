@@ -1,6 +1,6 @@
 # Audio-First Video Understanding Agent
 
-一个本地优先的视频理解工作台：上传短视频并输入问题后，系统会先理解音频，构建“盲人视角”的事件假设，再用少量目标关键帧验证或推翻这些假设，最后生成带时间戳证据的视频问答总结。
+一个本地优先的视频理解工作台：上传视频或输入视频 URL 并提问后，系统会先理解音频，构建“盲人视角”的事件假设，再用少量目标关键帧验证这些假设，最后生成带时间戳证据的视频问答总结。完成后也可以继续多轮追问。
 
 这个项目的重点不是“均匀抽帧再逐帧看”，而是一个有目的的 agent loop：
 
@@ -15,7 +15,7 @@ flowchart LR
   G --> H["预测下一段可见证据"]
   H --> I{"匹配吗？"}
   I -- "匹配" --> J["最终回答"]
-  I -- "冲突 / 不确定" --> E
+  I -- "需要更多证据" --> E
 ```
 
 ## 核心能力
@@ -26,7 +26,8 @@ flowchart LR
 - LangGraph 工作流：用 `StateGraph` 串起 ingest、audio、vision、prediction、verification、synthesis。
 - 本地优先存储：视频、音频、帧、状态和 SQLite 都保存在本地 `data/`，默认不上传到仓库。
 - 可降级转写：API 转写不可用时，可使用本地 faster-whisper 模型。
-- Web 工作台：React/Vite 前端展示进度、音频时间线、关键帧证据、预测验证和最终答案。
+- Web 工作台：React/Vite 前端展示进度、音频时间线、关键帧证据、覆盖情况、最终答案和多轮追问。
+- URL 输入：直链 mp4/webm/mov 可直接下载；站点页面链接可通过 `yt-dlp` 下载后进入同一条分析链路。
 
 ## 技术栈
 
@@ -35,6 +36,7 @@ flowchart LR
 - 多媒体处理：FFmpeg / ffprobe
 - 模型接口：OpenAI-compatible API
 - 本地音频兜底：faster-whisper
+- URL 下载：httpx / yt-dlp
 
 ## 目录结构
 
@@ -108,10 +110,19 @@ pnpm install
 OPENAI_API_KEY=你的_API_KEY
 OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
 AUDIO_FIRST_MOCK_MODE=false
+AUDIO_FIRST_FAST_MODE=false
 
 VISION_MODEL=gpt-5.4
 REASONING_MODEL=gpt-5.4
 REASONING_EFFORT=low
+
+# 可选：把本地 JoyAI-VL-Interaction 用作高速视觉验证器。
+# openai = 使用 VISION_MODEL；joyai = 使用本地 JoyAI adapter；auto = 先试 JoyAI，失败再回退到 VISION_MODEL。
+VISION_PROVIDER=openai
+JOYAI_API_BASE=http://127.0.0.1:8070/v1
+JOYAI_API_KEY=EMPTY
+JOYAI_MODEL=JoyAI-VL-Interaction-Preview
+JOYAI_TIMEOUT_SECONDS=30
 
 LOCAL_TRANSCRIBE_FALLBACK=true
 LOCAL_TRANSCRIBE_MODEL=data/models/faster-whisper-base
@@ -121,6 +132,10 @@ LLM_MAX_RETRIES=1
 ```
 
 如果没有可用 API，可以把 `AUDIO_FIRST_MOCK_MODE=true` 用于验证流程和界面。
+
+如果要启用 JoyAI 组合模式，先启动 JoyAI 的 vLLM 主服务和 `live_adapter.py`，确认 `http://127.0.0.1:8070/health` 返回 200，然后把 `VISION_PROVIDER=joyai`。此时 agent 仍然用音频转写和世界模型决定“该看哪里”，但目标帧视觉验证会交给本地 JoyAI，适合低延迟检查红布、囍字、人物动作、场景变化等可见证据。
+
+如果要优先速度，可以再设置 `AUDIO_FIRST_FAST_MODE=true`。快速模式会跳过耗时的大模型预测、验证和最终总结调用，改用本地启发式生成音频时间线、覆盖检查和中文答案；适合短视频快速质检，但细节推理会比完整模式粗一些。长视频下建议同时设置 `FAST_MAX_KEYFRAMES=12`、`FAST_SECONDS_PER_FRAME=120`，让 17 分钟级视频自动扩展到约 9 个关键画面，而不是固定只看 4 帧。
 
 ### 3. 启动服务
 
@@ -153,10 +168,14 @@ pnpm dev
 ## API
 
 - `POST /api/jobs`：上传视频和问题，返回 `job_id`
+- `POST /api/jobs/url`：传入 `{url, question}`，下载视频后创建同样的分析任务
 - `GET /api/jobs/{job_id}`：查询状态、进度、当前节点和错误
 - `GET /api/jobs/{job_id}/events`：SSE 进度流
-- `GET /api/jobs/{job_id}/result`：查询最终答案、时间线、关键帧和预测验证
+- `GET /api/jobs/{job_id}/partial`：查询已完成的音频、关键画面和观察结果，用于前端实时展示
+- `GET /api/jobs/{job_id}/result`：查询最终答案、时间线、关键帧和覆盖情况
+- `POST /api/jobs/{job_id}/ask`：基于已保存 state/result 继续追问
 - `GET /api/jobs/{job_id}/frames/{filename}`：读取抽取的帧图片
+- `GET /api/jobs/{job_id}/source`：读取上传或下载后的源视频，用于前端预览
 
 ## Agent 工作流
 
@@ -169,8 +188,8 @@ pnpm dev
 7. `extract_keyframes`：用 FFmpeg 抽帧，避开视频末尾不可抽取边界。
 8. `observe_frames`：批量多图回答“这一帧是否验证音频假设”。
 9. `predict_next_events`：预测后续可验证的视觉证据。
-10. `verify_predictions`：判定 match / conflict / uncertain。
-11. 若冲突或高不确定，回到 `plan_keyframes` 对相关窗口做二分式补帧。
+10. `verify_predictions`：内部判定 match / conflict / uncertain，并转化为用户可读的覆盖情况。
+11. 若需要更多证据，回到 `plan_keyframes` 对相关窗口做二分式补帧。
 12. `synthesize_answer`：生成最终中文总结，附证据和未确认点。
 
 ## 迭代实验
@@ -187,7 +206,7 @@ python scripts\benchmark_agent.py --video "C:\path\to\sample.mp4" --output data\
 - 音频窗口内的低成本候选帧扫描，先用本地视觉特征筛出可能有证据的帧。
 - 事件类型感知打分，例如婚礼/结尾更偏向音频事件后段，身份确认更偏向中后段。
 - 初始 enhanced 预算默认压到 `ENHANCED_INITIAL_KEYFRAMES=4`，把剩余预算留给预测误差回看。
-- 回看默认 `REFINEMENT_SAMPLES_PER_WINDOW=1`，每个冲突窗口只取一个二分中点。
+- 回看默认 `REFINEMENT_SAMPLES_PER_WINDOW=1`，每个需要更多证据的窗口只取一个二分中点。
 - `VISION_BATCH_SIZE=3`，一次视觉请求观察多张图，减少模型调度和网络往返。
 
 在当前样例视频上，最终一次实测结果如下。这里的准确率是针对已知关键事实的代理质量分，不是论文级数据集指标。
@@ -196,6 +215,20 @@ python scripts\benchmark_agent.py --video "C:\path\to\sample.mp4" --output data\
 | --- | ---: | ---: | ---: | ---: | --- |
 | legacy | 142.94s | 8 | 3 | 5/5 | 识别出救狐相认、婚礼、山林结尾证据不足 |
 | enhanced | 151.06s | 7 | 3 | 5/5 | 少看 1 帧，保留同等关键事实和不确定性判断 |
+
+接入 JoyAI 本地视觉验证器后，同一视频、同样 enhanced 抽帧策略的实测对比如下：
+
+| 视觉验证器 | 耗时 | 观察帧 | 视觉请求 | 代理质量分 | 关键结果 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| OpenAI-compatible `VISION_MODEL=gpt-5.4` | 131.56s | 4 | 2 | 5/5 | 识别出白狐相认、成婚、幸福生活旁白证据偏弱 |
+| JoyAI local adapter | 69.47s | 4 | 4 | 5/5 | 保持同等关键事实，完整流程约快 47%，约 1.9x |
+| JoyAI local adapter + `AUDIO_FIRST_FAST_MODE=true` | 10.27s | 4 | 4 | 5/5 | 跳过大模型预测/验证/总结，保留音频定位和 JoyAI 目标帧证据，答案更模板化 |
+
+这里 JoyAI 的请求数更高，是因为当前实现逐帧调用本地 adapter；但本地单帧延迟低，整体仍明显更快。这个组合验证了当前方向：音频和问题负责缩小注意力范围，JoyAI 负责快速确认目标帧证据。
+
+快速模式的节点级 profile 显示，10 秒样例视频的主要耗时已经变为本地转写、候选帧扫描和 JoyAI 观察帧：`transcribe_audio` 约 3.5s，`generate_frame_candidates` 约 2.8s，`observe_frames` 约 2.9s，其余推理节点基本为 0s。
+
+17 分 33 秒的 Bilibili 长视频样例也已跑通：`AUDIO_FIRST_FAST_MODE=true` + JoyAI local adapter 完整耗时约 90s，旧配置只抽取 4 个目标帧。现在快速模式支持按时长自适应关键帧预算，默认 `FAST_SECONDS_PER_FRAME=120`、`FAST_MAX_KEYFRAMES=12`，这类 17 分钟视频会规划约 9 个关键画面。节点 profile 显示旧配置下 `transcribe_audio` 本地 faster-whisper 占约 77s，候选帧扫描约 6s，JoyAI 观察约 3.8s；因此长视频的主要瓶颈已经转为全量音频转写。
 
 中间实验里，enhanced 虽已使用批量视觉请求，但仍因三点回看多观察 4 帧而慢 79%；加入二分式回看后，额外耗时降到 5.68%，同时少观察 1 帧。下一步主要优化空间是缓存候选帧特征、减少候选扫描 FFmpeg 启动次数，以及让验证器在结尾短窗口上更早停止回看。
 

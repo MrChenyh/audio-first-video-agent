@@ -126,3 +126,16 @@ def test_plan_keyframes_avoids_exact_video_end_for_extraction():
     )
 
     assert max(item["time"] for item in plan) < 10.08
+
+
+def test_plan_keyframes_handles_global_cover_without_audio_events():
+    plan = plan_keyframes(
+        duration=2.0,
+        audio_world_model={"timeline": []},
+        question="What happens?",
+        max_frames=4,
+    )
+
+    assert len(plan) == 4
+    assert plan[0]["time"] >= 0.0
+    assert plan[-1]["time"] < 2.0

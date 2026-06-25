@@ -162,8 +162,16 @@ class VideoUnderstandingWorkflow:
 
     def plan_keyframes_node(self, state: VideoAgentState) -> dict[str, Any]:
         max_frames = self.settings.max_keyframes
+        if self.settings.fast_mode:
+            duration = float(state.get("duration_seconds", 0.0))
+            adaptive = max(
+                self.settings.enhanced_initial_keyframes,
+                int((duration / self.settings.fast_seconds_per_frame) + 0.999),
+            )
+            max_frames = min(self.settings.fast_max_keyframes, adaptive)
         if (
             self.settings.keyframe_strategy == "enhanced"
+            and not self.settings.fast_mode
             and not int(state.get("refinement_rounds", 0))
             and state.get("frame_candidates")
         ):
@@ -215,6 +223,7 @@ class VideoUnderstandingWorkflow:
         new_observations = []
         total = max(1, len(new_frames))
         processed = 0
+        requests_used = 0
         batch_size = max(1, self.settings.vision_batch_size)
         for batch_start in range(0, len(new_frames), batch_size):
             batch = new_frames[batch_start : batch_start + batch_size]
@@ -225,6 +234,11 @@ class VideoUnderstandingWorkflow:
             )
             new_observations.extend(frame_observation)
             processed += len(batch)
+            requests_used += self.ai.last_vision_request_count
+            partial_observations = sorted(
+                list(state.get("frame_observations", [])) + new_observations,
+                key=lambda item: item["time"],
+            )
             progress = min(79, NODE_PROGRESS["observe_frames"] + int((processed / total) * 9))
             self.store.update_job(
                 state["job_id"],
@@ -232,11 +246,18 @@ class VideoUnderstandingWorkflow:
                 current_node=f"observe_frames {processed}/{total}",
                 progress=progress,
             )
+            self.store.save_state(
+                state["job_id"],
+                {
+                    **state,
+                    "frame_observations": partial_observations,
+                    "vision_request_count": int(state.get("vision_request_count", 0)) + requests_used,
+                },
+            )
         observations = sorted(
             list(state.get("frame_observations", [])) + new_observations,
             key=lambda item: item["time"],
         )
-        requests_used = 0 if not new_frames else ((len(new_frames) + batch_size - 1) // batch_size)
         return {
             "frame_observations": observations,
             "vision_request_count": int(state.get("vision_request_count", 0)) + requests_used,
@@ -255,6 +276,13 @@ class VideoUnderstandingWorkflow:
             predictions=state.get("predictions", []),
             observations=state.get("frame_observations", []),
         )
+        if self.settings.fast_mode:
+            return {
+                "prediction_checks": checks,
+                "refinement_windows": [],
+                "refinement_rounds": int(state.get("refinement_rounds", 0)),
+                "should_refine": False,
+            }
         conflict_windows = []
         observed_times = [float(obs.get("time", 0.0)) for obs in state.get("frame_observations", [])]
         for check in checks:
@@ -319,6 +347,11 @@ class VideoUnderstandingWorkflow:
                 "height": state.get("height"),
                 "has_audio": state.get("has_audio"),
                 "mock_mode": self.settings.use_mock_models,
+                "fast_mode": self.settings.fast_mode,
+                "vision_provider": self.settings.vision_provider,
+                "vision_model": self.settings.joyai_model
+                if self.settings.vision_provider in {"joyai", "joyai_adapter"}
+                else self.settings.vision_model,
                 "vision_request_count": state.get("vision_request_count", 0),
             },
             "transcription_status": state.get("transcription_status", {}),

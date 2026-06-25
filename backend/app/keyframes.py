@@ -166,6 +166,9 @@ def _choose_budgeted_frames(candidates: list[dict[str, Any]], max_frames: int) -
             break
         if item in selected:
             continue
+        if not selected:
+            add(item)
+            continue
         selected_times = sorted(float(chosen["time"]) for chosen in selected)
         nearest_gap = min(abs(float(item["time"]) - time) for time in selected_times)
         if nearest_gap >= 0.35:
@@ -178,6 +181,10 @@ def _choose_budgeted_frames(candidates: list[dict[str, Any]], max_frames: int) -
         for item in candidates:
             if item in selected:
                 continue
+            if not selected_times:
+                best_item = item
+                best_gap = float("inf")
+                break
             nearest_gap = min(abs(float(item["time"]) - time) for time in selected_times)
             if nearest_gap > best_gap:
                 best_gap = nearest_gap
