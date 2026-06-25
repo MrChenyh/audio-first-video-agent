@@ -35,12 +35,26 @@ def test_plan_keyframes_adds_refinement_windows():
         audio_world_model={"timeline": []},
         question="What changed?",
         refinement_windows=[{"start": 20.0, "end": 24.0}],
+        refinement_samples_per_window=3,
     )
 
     times = [item["time"] for item in plan]
     assert 20.0 in times
     assert 22.0 in times
     assert 24.0 in times
+
+
+def test_plan_keyframes_can_use_binary_refinement_probe():
+    plan = plan_keyframes(
+        duration=60.0,
+        audio_world_model={"timeline": []},
+        question="What changed?",
+        refinement_windows=[{"start": 20.0, "end": 24.0}],
+        refinement_samples_per_window=1,
+        max_frames=1,
+    )
+
+    assert [item["time"] for item in plan] == [22.0]
 
 
 def test_plan_keyframes_budget_keeps_late_video_coverage():

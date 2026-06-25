@@ -96,6 +96,8 @@ class VideoAgentState(TypedDict, total=False):
     transcript_segments: list[dict[str, Any]]
     transcription_status: dict[str, Any]
     audio_world_model: dict[str, Any]
+    frame_candidates: list[dict[str, Any]]
+    vision_request_count: int
     keyframe_plan: list[dict[str, Any]]
     extracted_frames: list[dict[str, Any]]
     frame_observations: list[dict[str, Any]]

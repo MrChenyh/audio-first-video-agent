@@ -279,64 +279,109 @@ class AIClient:
             return observations
 
         observations: list[dict[str, Any]] = []
-        for frame in frames:
-            image_data = self._image_data_url(Path(frame["path"]))
-            schema = {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "scene": {"type": "string"},
-                    "objects": {"type": "array", "items": {"type": "string"}},
-                    "actions": {"type": "array", "items": {"type": "string"}},
-                    "visible_text": {"type": "array", "items": {"type": "string"}},
-                    "audio_alignment": {"type": "string", "enum": ["match", "conflict", "uncertain"]},
-                    "visual_target": {"type": "string"},
-                    "evidence_assessment": {"type": "string"},
-                    "notes": {"type": "string"},
-                },
-                "required": [
-                    "scene",
-                    "objects",
-                    "actions",
-                    "visible_text",
-                    "audio_alignment",
-                    "visual_target",
-                    "evidence_assessment",
-                    "notes",
-                ],
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "filename": {"type": "string"},
+                            "scene": {"type": "string"},
+                            "objects": {"type": "array", "items": {"type": "string"}},
+                            "actions": {"type": "array", "items": {"type": "string"}},
+                            "visible_text": {"type": "array", "items": {"type": "string"}},
+                            "audio_alignment": {"type": "string", "enum": ["match", "conflict", "uncertain"]},
+                            "visual_target": {"type": "string"},
+                            "evidence_assessment": {"type": "string"},
+                            "notes": {"type": "string"},
+                        },
+                        "required": [
+                            "filename",
+                            "scene",
+                            "objects",
+                            "actions",
+                            "visible_text",
+                            "audio_alignment",
+                            "visual_target",
+                            "evidence_assessment",
+                            "notes",
+                        ],
+                    },
+                }
+            },
+            "required": ["observations"],
+        }
+        frame_manifest = [
+            {
+                "index": index,
+                "filename": frame["filename"],
+                "time": frame["time"],
+                "reason": frame.get("reason", ""),
+                "probe": frame.get("probe") or {},
             }
-            probe = frame.get("probe") or {}
-            prompt = (
-                "Inspect this video frame as targeted evidence for an audio-first video understanding loop. "
-                "Do not merely caption the image. First answer the frame-specific visual target, then decide "
-                "whether the frame matches, conflicts with, or is uncertain for the audio-derived hypothesis. "
-                "If the frame is too early, too late, cropped, or visually ambiguous, mark audio_alignment as uncertain.\n\n"
-                f"Frame timestamp: {frame['time']:.2f}s\n"
-                f"Reason selected: {frame.get('reason', '')}\n"
-                f"Frame-specific visual target: {json.dumps(probe, ensure_ascii=False)}\n"
-                f"Question: {question}\n"
-                f"Audio world model: {json.dumps(audio_world_model, ensure_ascii=False)}"
+            for index, frame in enumerate(frames, start=1)
+        ]
+        prompt = (
+            "Inspect these video frames as targeted evidence for an audio-first video understanding loop. "
+            "The images are provided in the same order as the frame manifest. Return exactly one observation for "
+            "each manifest item, preserving the filename. Do not merely caption the image. First answer each "
+            "frame-specific visual target, then decide whether the frame matches, conflicts with, or is uncertain "
+            "for the audio-derived hypothesis. If a frame is too early, too late, cropped, or visually ambiguous, "
+            "mark audio_alignment as uncertain.\n\n"
+            f"Question: {question}\n"
+            f"Frame manifest: {json.dumps(frame_manifest, ensure_ascii=False)}\n"
+            f"Audio world model: {json.dumps(audio_world_model, ensure_ascii=False)}"
+        )
+        images = [self._image_data_url(Path(frame["path"])) for frame in frames]
+        try:
+            payload = self._responses_json(
+                self.settings.vision_model,
+                prompt,
+                schema,
+                "frame_observations",
+                images=images,
             )
-            try:
-                payload = self._responses_json(
-                    self.settings.vision_model,
-                    prompt,
-                    schema,
-                    "frame_observation",
-                    images=[image_data],
-                )
-            except Exception:
-                if not self.settings.allow_model_fallback:
-                    raise
-                payload = {
+            raw_observations = payload.get("observations", [])
+        except Exception:
+            if not self.settings.allow_model_fallback:
+                raise
+            raw_observations = [
+                {
+                    "filename": frame["filename"],
                     "scene": "Frame extracted successfully, but the configured model endpoint could not inspect images.",
                     "objects": [],
                     "actions": [],
                     "visible_text": [],
                     "audio_alignment": "uncertain",
-                    "visual_target": str(probe.get("question") or frame.get("reason", "")),
+                    "visual_target": str((frame.get("probe") or {}).get("question") or frame.get("reason", "")),
                     "evidence_assessment": "The image endpoint could not inspect this frame.",
                     "notes": "Model fallback observation.",
+                }
+                for frame in frames
+            ]
+
+        by_filename = {
+            str(item.get("filename") or ""): item
+            for item in raw_observations
+            if isinstance(item, dict)
+        }
+        for frame in frames:
+            payload = by_filename.get(frame["filename"])
+            if not payload:
+                payload = {
+                    "filename": frame["filename"],
+                    "scene": "The batch vision response did not include this frame.",
+                    "objects": [],
+                    "actions": [],
+                    "visible_text": [],
+                    "audio_alignment": "uncertain",
+                    "visual_target": str((frame.get("probe") or {}).get("question") or frame.get("reason", "")),
+                    "evidence_assessment": "Missing per-frame observation in batch response.",
+                    "notes": "Batch response repair.",
                 }
             payload["time"] = frame["time"]
             payload["filename"] = frame["filename"]

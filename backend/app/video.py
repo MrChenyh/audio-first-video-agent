@@ -236,6 +236,43 @@ class VideoProcessor:
                 fallback_path.unlink(missing_ok=True)
             raise RuntimeError(f"ffmpeg frame extraction failed: {completed.stderr.strip()}")
 
+    def extract_analysis_frame(self, video_path: Path, time_seconds: float, output_path: Path, size: int = 96) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.settings.use_mock_models and not self.settings.ffmpeg_path:
+            output_path.write_bytes(_mock_ppm(size, size))
+            return
+        ffmpeg = self.ffmpeg
+        if not ffmpeg:
+            if self.settings.use_mock_models:
+                output_path.write_bytes(_mock_ppm(size, size))
+                return
+            raise RuntimeError("ffmpeg was not found. Install FFmpeg or set FFMPEG_PATH.")
+
+        command = [
+            ffmpeg,
+            "-y",
+            "-ss",
+            f"{max(0.0, time_seconds):.2f}",
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={size}:{size}:force_original_aspect_ratio=decrease,pad={size}:{size}:(ow-iw)/2:(oh-ih)/2,format=rgb24",
+            "-f",
+            "image2",
+            "-vcodec",
+            "ppm",
+            str(output_path),
+        ]
+        completed = self._run_media_command(command)
+        if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+            retry_command = command.copy()
+            retry_command[retry_command.index(f"{max(0.0, time_seconds):.2f}")] = f"{max(0.0, time_seconds - 0.05):.2f}"
+            retry = self._run_media_command(retry_command)
+            if retry.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+                raise RuntimeError(f"ffmpeg analysis frame extraction failed: {completed.stderr.strip()}")
+
     @staticmethod
     def _run_media_command(command: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -246,3 +283,12 @@ class VideoProcessor:
             errors="replace",
             check=False,
         )
+
+
+def _mock_ppm(width: int, height: int) -> bytes:
+    header = f"P6\n{width} {height}\n255\n".encode("ascii")
+    pixels = bytearray()
+    for y in range(height):
+        for x in range(width):
+            pixels.extend((x % 256, y % 256, (x + y) % 256))
+    return header + bytes(pixels)

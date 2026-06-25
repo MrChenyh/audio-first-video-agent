@@ -11,6 +11,7 @@ except Exception:  # pragma: no cover
     MemorySaver = None  # type: ignore[assignment]
 
 from .ai import AIClient
+from .candidates import generate_frame_candidates
 from .config import Settings
 from .keyframes import plan_keyframes
 from .models import VideoAgentState
@@ -26,6 +27,7 @@ NODE_PROGRESS: ProgressMap = {
     "extract_audio": 15,
     "transcribe_audio": 25,
     "build_audio_world_model": 38,
+    "generate_frame_candidates": 44,
     "plan_keyframes": 48,
     "extract_keyframes": 58,
     "observe_frames": 70,
@@ -49,6 +51,10 @@ class VideoUnderstandingWorkflow:
         builder.add_node("extract_audio", self._node("extract_audio", self.extract_audio))
         builder.add_node("transcribe_audio", self._node("transcribe_audio", self.transcribe_audio))
         builder.add_node("build_audio_world_model", self._node("build_audio_world_model", self.build_audio_world_model))
+        builder.add_node(
+            "generate_frame_candidates",
+            self._node("generate_frame_candidates", self.generate_frame_candidates_node),
+        )
         builder.add_node("plan_keyframes", self._node("plan_keyframes", self.plan_keyframes_node))
         builder.add_node("extract_keyframes", self._node("extract_keyframes", self.extract_keyframes))
         builder.add_node("observe_frames", self._node("observe_frames", self.observe_frames))
@@ -60,7 +66,8 @@ class VideoUnderstandingWorkflow:
         builder.add_edge("ingest_video", "extract_audio")
         builder.add_edge("extract_audio", "transcribe_audio")
         builder.add_edge("transcribe_audio", "build_audio_world_model")
-        builder.add_edge("build_audio_world_model", "plan_keyframes")
+        builder.add_edge("build_audio_world_model", "generate_frame_candidates")
+        builder.add_edge("generate_frame_candidates", "plan_keyframes")
         builder.add_edge("plan_keyframes", "extract_keyframes")
         builder.add_edge("extract_keyframes", "observe_frames")
         builder.add_edge("observe_frames", "predict_next_events")
@@ -115,6 +122,7 @@ class VideoUnderstandingWorkflow:
             "width": int(metadata["width"]),
             "height": int(metadata["height"]),
             "has_audio": bool(metadata["has_audio"]),
+            "vision_request_count": int(state.get("vision_request_count", 0)),
             "refinement_rounds": int(state.get("refinement_rounds", 0)),
             "refinement_windows": state.get("refinement_windows", []),
             "should_refine": False,
@@ -139,14 +147,36 @@ class VideoUnderstandingWorkflow:
         )
         return {"audio_world_model": world_model}
 
+    def generate_frame_candidates_node(self, state: VideoAgentState) -> dict[str, Any]:
+        if state.get("refinement_rounds", 0):
+            return {"frame_candidates": state.get("frame_candidates", [])}
+        candidates = generate_frame_candidates(
+            video_path=Path(state["video_path"]),
+            duration=float(state.get("duration_seconds", 0.0)),
+            audio_world_model=state.get("audio_world_model", {}),
+            question=state["question"],
+            processor=self.processor,
+            settings=self.settings,
+        )
+        return {"frame_candidates": candidates}
+
     def plan_keyframes_node(self, state: VideoAgentState) -> dict[str, Any]:
+        max_frames = self.settings.max_keyframes
+        if (
+            self.settings.keyframe_strategy == "enhanced"
+            and not int(state.get("refinement_rounds", 0))
+            and state.get("frame_candidates")
+        ):
+            max_frames = min(max_frames, self.settings.enhanced_initial_keyframes)
         plan = plan_keyframes(
             duration=float(state["duration_seconds"]),
             audio_world_model=state.get("audio_world_model", {}),
             question=state["question"],
             existing_plan=state.get("keyframe_plan", []),
             refinement_windows=state.get("refinement_windows", []),
-            max_frames=self.settings.max_keyframes,
+            frame_candidates=state.get("frame_candidates", []),
+            max_frames=max_frames,
+            refinement_samples_per_window=self.settings.refinement_samples_per_window,
         )
         return {
             "keyframe_plan": plan,
@@ -184,25 +214,33 @@ class VideoUnderstandingWorkflow:
         new_frames = [frame for frame in state.get("extracted_frames", []) if frame["filename"] not in already]
         new_observations = []
         total = max(1, len(new_frames))
-        for index, frame in enumerate(new_frames, start=1):
+        processed = 0
+        batch_size = max(1, self.settings.vision_batch_size)
+        for batch_start in range(0, len(new_frames), batch_size):
+            batch = new_frames[batch_start : batch_start + batch_size]
             frame_observation = self.ai.observe_frames(
                 question=state["question"],
-                frames=[frame],
+                frames=batch,
                 audio_world_model=state.get("audio_world_model", {}),
             )
             new_observations.extend(frame_observation)
-            progress = min(79, NODE_PROGRESS["observe_frames"] + int((index / total) * 9))
+            processed += len(batch)
+            progress = min(79, NODE_PROGRESS["observe_frames"] + int((processed / total) * 9))
             self.store.update_job(
                 state["job_id"],
                 status="running",
-                current_node=f"observe_frames {index}/{total}",
+                current_node=f"observe_frames {processed}/{total}",
                 progress=progress,
             )
         observations = sorted(
             list(state.get("frame_observations", [])) + new_observations,
             key=lambda item: item["time"],
         )
-        return {"frame_observations": observations}
+        requests_used = 0 if not new_frames else ((len(new_frames) + batch_size - 1) // batch_size)
+        return {
+            "frame_observations": observations,
+            "vision_request_count": int(state.get("vision_request_count", 0)) + requests_used,
+        }
 
     def predict_next_events(self, state: VideoAgentState) -> dict[str, Any]:
         predictions = self.ai.predict_next_events(
@@ -281,6 +319,7 @@ class VideoUnderstandingWorkflow:
                 "height": state.get("height"),
                 "has_audio": state.get("has_audio"),
                 "mock_mode": self.settings.use_mock_models,
+                "vision_request_count": state.get("vision_request_count", 0),
             },
             "transcription_status": state.get("transcription_status", {}),
         }

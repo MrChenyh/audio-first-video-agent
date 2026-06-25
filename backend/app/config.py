@@ -36,6 +36,13 @@ class Settings:
     max_video_seconds: float
     max_refinement_rounds: int
     max_keyframes: int
+    enhanced_initial_keyframes: int
+    refinement_samples_per_window: int
+    keyframe_strategy: str
+    candidate_sample_fps: float
+    candidate_max_per_event: int
+    candidate_hash_min_distance: int
+    vision_batch_size: int
     llm_timeout_seconds: float
     llm_max_retries: int
     allow_model_fallback: bool
@@ -82,6 +89,13 @@ def load_settings() -> Settings:
         max_video_seconds=float(os.getenv("MAX_VIDEO_SECONDS", "600")),
         max_refinement_rounds=int(os.getenv("MAX_REFINEMENT_ROUNDS", "1")),
         max_keyframes=int(os.getenv("MAX_KEYFRAMES", "8")),
+        enhanced_initial_keyframes=max(1, int(os.getenv("ENHANCED_INITIAL_KEYFRAMES", "4"))),
+        refinement_samples_per_window=max(1, int(os.getenv("REFINEMENT_SAMPLES_PER_WINDOW", "1"))),
+        keyframe_strategy=os.getenv("KEYFRAME_STRATEGY", "enhanced").strip().lower(),
+        candidate_sample_fps=float(os.getenv("CANDIDATE_SAMPLE_FPS", "3")),
+        candidate_max_per_event=int(os.getenv("CANDIDATE_MAX_PER_EVENT", "2")),
+        candidate_hash_min_distance=int(os.getenv("CANDIDATE_HASH_MIN_DISTANCE", "4")),
+        vision_batch_size=max(1, int(os.getenv("VISION_BATCH_SIZE", "3"))),
         llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "90")),
         llm_max_retries=int(os.getenv("LLM_MAX_RETRIES", "1")),
         allow_model_fallback=_bool_env(os.getenv("ALLOW_MODEL_FALLBACK"), True),

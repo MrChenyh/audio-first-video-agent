@@ -229,7 +229,9 @@ def plan_keyframes(
     question: str,
     existing_plan: list[dict[str, Any]] | None = None,
     refinement_windows: list[dict[str, Any]] | None = None,
+    frame_candidates: list[dict[str, Any]] | None = None,
     max_frames: int = 48,
+    refinement_samples_per_window: int = 3,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     world_model = audio_world_model or {}
@@ -304,6 +306,20 @@ def plan_keyframes(
             for time in _binary_cover_times(duration, depth=3):
                 _add_candidate(candidates, time, f"binary global cover for question: {question[:80]}", "global", 60)
 
+    for candidate in frame_candidates or []:
+        event_index = candidate.get("event_index")
+        group = f"audio_event_{event_index}" if event_index is not None else "visual_candidate"
+        score = max(0.0, min(1.0, _safe_float(candidate.get("score"), 0.5)))
+        _add_candidate(
+            candidates,
+            _safe_float(candidate.get("time"), 0.0),
+            str(candidate.get("reason") or "enhanced visual candidate"),
+            str(candidate.get("source") or "visual_candidate"),
+            70 + int(score * 25),
+            group=group,
+            probe=candidate.get("probe"),
+        )
+
     for item in existing_plan or []:
         _add_candidate(
             candidates,
@@ -329,15 +345,27 @@ def plan_keyframes(
             "user_question": question,
         }
         group = f"refinement_{index}"
-        _add_candidate(
-            candidates,
-            start,
-            "targeted refinement start: verify missing or conflicting prediction evidence",
-            "refinement",
-            108,
-            group=group,
-            probe=probe,
-        )
+        if refinement_samples_per_window >= 3:
+            _add_candidate(
+                candidates,
+                start,
+                "targeted refinement start: verify missing or conflicting prediction evidence",
+                "refinement",
+                108,
+                group=group,
+                probe=probe,
+            )
+        elif refinement_samples_per_window >= 2:
+            quarter = start + ((end - start) * 0.25)
+            _add_candidate(
+                candidates,
+                quarter,
+                "targeted refinement lower binary probe: verify missing or conflicting prediction evidence",
+                "refinement",
+                112,
+                group=group,
+                probe=probe,
+            )
         _add_candidate(
             candidates,
             midpoint,
@@ -347,15 +375,27 @@ def plan_keyframes(
             group=group,
             probe=probe,
         )
-        _add_candidate(
-            candidates,
-            end,
-            "targeted refinement end: verify missing or conflicting prediction evidence",
-            "refinement",
-            108,
-            group=group,
-            probe=probe,
-        )
+        if refinement_samples_per_window >= 3:
+            _add_candidate(
+                candidates,
+                end,
+                "targeted refinement end: verify missing or conflicting prediction evidence",
+                "refinement",
+                108,
+                group=group,
+                probe=probe,
+            )
+        elif refinement_samples_per_window >= 2:
+            upper = start + ((end - start) * 0.75)
+            _add_candidate(
+                candidates,
+                upper,
+                "targeted refinement upper binary probe: verify missing or conflicting prediction evidence",
+                "refinement",
+                112,
+                group=group,
+                probe=probe,
+            )
 
     planned = _dedupe_candidates(candidates, duration)
     budgeted = _choose_budgeted_frames(planned, max_frames)

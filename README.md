@@ -164,13 +164,40 @@ pnpm dev
 2. `extract_audio`：抽取 16kHz mono WAV。
 3. `transcribe_audio`：优先 API 转写，失败时使用本地 faster-whisper。
 4. `build_audio_world_model`：只根据音频构建事件时间线和可验证视觉假设。
-5. `plan_keyframes`：把音频事件变成目标帧验证问题，并在预算内选择少量帧。
-6. `extract_keyframes`：用 FFmpeg 抽帧，避开视频末尾不可抽取边界。
-7. `observe_frames`：逐帧回答“这一帧是否验证音频假设”。
-8. `predict_next_events`：预测后续可验证的视觉证据。
-9. `verify_predictions`：判定 match / conflict / uncertain。
-10. 若冲突或高不确定，回到 `plan_keyframes` 只加密相关窗口。
-11. `synthesize_answer`：生成最终中文总结，附证据和未确认点。
+5. `generate_frame_candidates`：在音频事件窗口内抽取低分辨率分析帧，用亮度变化、average hash、边缘密度和事件类型生成低成本候选帧。
+6. `plan_keyframes`：把音频事件变成目标帧验证问题，融合候选帧，并在预算内选择少量帧。
+7. `extract_keyframes`：用 FFmpeg 抽帧，避开视频末尾不可抽取边界。
+8. `observe_frames`：批量多图回答“这一帧是否验证音频假设”。
+9. `predict_next_events`：预测后续可验证的视觉证据。
+10. `verify_predictions`：判定 match / conflict / uncertain。
+11. 若冲突或高不确定，回到 `plan_keyframes` 对相关窗口做二分式补帧。
+12. `synthesize_answer`：生成最终中文总结，附证据和未确认点。
+
+## 迭代实验
+
+本仓库包含一个可复现实验脚本，用同一视频对比旧策略和增强策略：
+
+```powershell
+$env:PYTHONPATH="backend"
+python scripts\benchmark_agent.py --video "C:\path\to\sample.mp4" --output data\benchmarks\latest.json
+```
+
+当前增强策略包括：
+
+- 音频窗口内的低成本候选帧扫描，先用本地视觉特征筛出可能有证据的帧。
+- 事件类型感知打分，例如婚礼/结尾更偏向音频事件后段，身份确认更偏向中后段。
+- 初始 enhanced 预算默认压到 `ENHANCED_INITIAL_KEYFRAMES=4`，把剩余预算留给预测误差回看。
+- 回看默认 `REFINEMENT_SAMPLES_PER_WINDOW=1`，每个冲突窗口只取一个二分中点。
+- `VISION_BATCH_SIZE=3`，一次视觉请求观察多张图，减少模型调度和网络往返。
+
+在当前样例视频上，最终一次实测结果如下。这里的准确率是针对已知关键事实的代理质量分，不是论文级数据集指标。
+
+| 策略 | 耗时 | 观察帧 | 视觉请求 | 代理质量分 | 关键结果 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| legacy | 142.94s | 8 | 3 | 5/5 | 识别出救狐相认、婚礼、山林结尾证据不足 |
+| enhanced | 151.06s | 7 | 3 | 5/5 | 少看 1 帧，保留同等关键事实和不确定性判断 |
+
+中间实验里，enhanced 虽已使用批量视觉请求，但仍因三点回看多观察 4 帧而慢 79%；加入二分式回看后，额外耗时降到 5.68%，同时少观察 1 帧。下一步主要优化空间是缓存候选帧特征、减少候选扫描 FFmpeg 启动次数，以及让验证器在结尾短窗口上更早停止回看。
 
 ## 测试
 
@@ -193,6 +220,7 @@ pnpm build
 - 音频引导抽帧和去重。
 - 预算帧数下保留关键后段证据。
 - 不抽视频精确末尾帧。
+- enhanced 候选帧分类、候选 probe 和二分式 refinement。
 - 预测验证的 match / conflict / uncertain。
 - LangGraph mock 流程完整跑通。
 - 不确定预测触发局部 refinement。
@@ -201,7 +229,7 @@ pnpm build
 
 - v1 是产品原型，不做论文级 benchmark。
 - 当前主要处理本地上传视频，不包含用户权限、云存储和队列系统。
-- 视频视觉理解仍依赖逐帧图像模型调用，慢速模型会影响 70% 的观察阶段。
+- 视频视觉理解仍依赖图像模型调用；当前已支持批量多图观察，但慢速模型仍会影响观察阶段。
 - 直接视频多模态模型可以作为旁路全局视觉扫描，但当前主线仍是“音频先验 + 目标帧验证”。
 - 若代理 API 不支持音频接口，转写会使用本地 faster-whisper fallback。
 
