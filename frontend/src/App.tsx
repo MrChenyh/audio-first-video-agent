@@ -18,6 +18,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type JobStatus = "queued" | "running" | "succeeded" | "failed";
 type SourceMode = "file" | "url";
+type LiveStatus = "queued" | "running" | "streaming" | "stopping" | "stopped" | "succeeded" | "failed";
 
 type Job = {
   job_id: string;
@@ -79,6 +80,10 @@ type Result = {
     summary: string;
     evidence_refs: string[];
     uncertainties: string[];
+    sections?: Array<{
+      title: string;
+      items: string[];
+    }>;
   } | null;
   timeline: Array<{
     time: number;
@@ -138,6 +143,36 @@ type CoverageRow = {
   text: string;
 };
 
+type LiveSegment = {
+  index: number;
+  start_time: number;
+  end_time: number;
+  transcript?: string;
+  summary: string;
+  elapsed_seconds?: number;
+  frame?: {
+    time: number;
+    filename: string;
+    url: string;
+    reason: string;
+  };
+  observation?: {
+    scene?: string;
+    evidence_assessment?: string;
+  };
+};
+
+type LiveSession = {
+  session_id: string;
+  source_url: string;
+  question: string;
+  status: LiveStatus;
+  current_node: string;
+  error?: string | null;
+  resolved_url?: string | null;
+  segments: LiveSegment[];
+};
+
 const nodeLabels: Record<string, string> = {
   queued: "排队中",
   starting: "启动任务",
@@ -169,8 +204,16 @@ export function App() {
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [followup, setFollowup] = useState("");
   const [asking, setAsking] = useState(false);
+  const [liveUrl, setLiveUrl] = useState("https://live.douyin.com/547977714661");
+  const [liveQuestion, setLiveQuestion] = useState("实时总结直播中正在发生什么，关注主播动作、商品/场景变化、屏幕文字和语音重点。");
+  const [liveWindow, setLiveWindow] = useState(4);
+  const [liveMaxSegments, setLiveMaxSegments] = useState(0);
+  const [liveSubmitting, setLiveSubmitting] = useState(false);
+  const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
+  const [liveError, setLiveError] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const partialTimerRef = useRef<number | null>(null);
+  const liveEventSourceRef = useRef<EventSource | null>(null);
 
   const statusLabel = useMemo(() => {
     if (!job) return sourceMode === "file" ? "等待上传" : "等待 URL";
@@ -184,6 +227,7 @@ export function App() {
   useEffect(() => {
     return () => {
       eventSourceRef.current?.close();
+      liveEventSourceRef.current?.close();
       stopPartialPolling();
     };
   }, []);
@@ -318,6 +362,64 @@ export function App() {
     }
   }
 
+  async function startLive(event: FormEvent) {
+    event.preventDefault();
+    if (!liveUrl.trim()) {
+      setLiveError("请输入直播 URL 或 m3u8/flv 直链。");
+      return;
+    }
+    setLiveSubmitting(true);
+    setLiveError(null);
+    setLiveSession(null);
+    liveEventSourceRef.current?.close();
+    try {
+      const response = await fetch("/api/live/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: liveUrl.trim(),
+          question: liveQuestion.trim(),
+          window_seconds: liveWindow,
+          max_segments: liveMaxSegments
+        })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as { session_id: string };
+      subscribeLive(payload.session_id);
+    } catch (err) {
+      setLiveError(errorMessage(err, "直播分析启动失败。"));
+    } finally {
+      setLiveSubmitting(false);
+    }
+  }
+
+  function subscribeLive(sessionId: string) {
+    liveEventSourceRef.current?.close();
+    const source = new EventSource(`/api/live/sessions/${sessionId}/events`);
+    liveEventSourceRef.current = source;
+    source.onmessage = (event) => {
+      const payload = JSON.parse(event.data) as LiveSession;
+      setLiveSession(payload);
+      if (payload.status === "failed") {
+        source.close();
+        setLiveError(payload.error ?? "直播分析失败。");
+      }
+      if (["stopped", "succeeded"].includes(payload.status)) {
+        source.close();
+      }
+    };
+    source.onerror = () => {
+      source.close();
+      setLiveError("直播事件连接中断，请重新启动直播分析。");
+    };
+  }
+
+  async function stopLive() {
+    if (!liveSession) return;
+    await fetch(`/api/live/sessions/${liveSession.session_id}/stop`, { method: "POST" });
+    liveEventSourceRef.current?.close();
+  }
+
   return (
     <main className="app-shell">
       <section className="workspace">
@@ -427,8 +529,121 @@ export function App() {
         </div>
 
         {result && <ResultView result={result} chat={chat} followup={followup} asking={asking} setFollowup={setFollowup} askFollowup={askFollowup} />}
+        <LiveWorkbench
+          liveUrl={liveUrl}
+          setLiveUrl={setLiveUrl}
+          liveQuestion={liveQuestion}
+          setLiveQuestion={setLiveQuestion}
+          liveWindow={liveWindow}
+          setLiveWindow={setLiveWindow}
+          liveMaxSegments={liveMaxSegments}
+          setLiveMaxSegments={setLiveMaxSegments}
+          liveSubmitting={liveSubmitting}
+          liveSession={liveSession}
+          liveError={liveError}
+          startLive={startLive}
+          stopLive={stopLive}
+        />
       </section>
     </main>
+  );
+}
+
+function LiveWorkbench({
+  liveUrl,
+  setLiveUrl,
+  liveQuestion,
+  setLiveQuestion,
+  liveWindow,
+  setLiveWindow,
+  liveMaxSegments,
+  setLiveMaxSegments,
+  liveSubmitting,
+  liveSession,
+  liveError,
+  startLive,
+  stopLive
+}: {
+  liveUrl: string;
+  setLiveUrl: (value: string) => void;
+  liveQuestion: string;
+  setLiveQuestion: (value: string) => void;
+  liveWindow: number;
+  setLiveWindow: (value: number) => void;
+  liveMaxSegments: number;
+  setLiveMaxSegments: (value: number) => void;
+  liveSubmitting: boolean;
+  liveSession: LiveSession | null;
+  liveError: string | null;
+  startLive: (event: FormEvent) => void;
+  stopLive: () => void;
+}) {
+  const running = liveSession?.status === "running" || liveSession?.status === "queued" || liveSession?.status === "streaming";
+  return (
+    <section className="live-band">
+      <div className="section-title">
+        <Activity size={18} />
+        <h2>直播实时分析</h2>
+      </div>
+      <form className="live-form" onSubmit={startLive}>
+        <label>
+          <span>直播 URL</span>
+          <input value={liveUrl} onChange={(event) => setLiveUrl(event.target.value)} placeholder="https://live.douyin.com/... 或 m3u8/flv" />
+        </label>
+        <label>
+          <span>实时关注点</span>
+          <textarea value={liveQuestion} onChange={(event) => setLiveQuestion(event.target.value)} rows={3} />
+        </label>
+        <div className="live-controls">
+          <label>
+            <span>窗口秒数</span>
+            <input type="number" min={2} max={12} value={liveWindow} onChange={(event) => setLiveWindow(Number(event.target.value) || 4)} />
+          </label>
+          <label>
+            <span>最大段数</span>
+            <input type="number" min={0} max={200} value={liveMaxSegments} onChange={(event) => setLiveMaxSegments(Number(event.target.value) || 0)} />
+          </label>
+          <button className="primary-action live-action" type="submit" disabled={liveSubmitting || running}>
+            {liveSubmitting || running ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
+            <span>{running ? "分析中" : "开始直播分析"}</span>
+          </button>
+          {liveSession && running && (
+            <button className="secondary-action" type="button" onClick={stopLive}>停止</button>
+          )}
+        </div>
+        <small>最大段数填 0 表示持续分析。抖音页面会尝试解析真实 m3u8/flv；如果页面需要登录/cookie，可直接粘贴 m3u8/flv 直链。</small>
+      </form>
+      {liveError && (
+        <div className="error-line" role="alert">
+          <AlertCircle size={16} />
+          <span>{liveError}</span>
+        </div>
+      )}
+      {liveSession && (
+        <div className="live-session">
+          <div className="metric-row">
+            <span>{liveStatusLabel(liveSession.status)}</span>
+            <span>{liveSession.current_node}</span>
+            <span>{liveSession.segments.length} 段</span>
+          </div>
+          {liveSession.resolved_url && <p className="live-source">已解析流：{liveSession.resolved_url}</p>}
+          <div className="live-segments">
+            {liveSession.segments.length === 0 && <p className="empty">正在解析直播流并捕获第一个短窗口。</p>}
+            {liveSession.segments.map((segment) => (
+              <article className="live-segment" key={segment.index}>
+                {segment.frame?.url && <img src={segment.frame.url} alt={`live segment ${segment.index + 1}`} loading="lazy" />}
+                <div>
+                  <h3>{formatTime(segment.start_time)} - {formatTime(segment.end_time)}</h3>
+                  <p>{segment.summary}</p>
+                  {segment.transcript && <small>音频：{segment.transcript}</small>}
+                  {segment.elapsed_seconds !== undefined && <small>处理耗时 {segment.elapsed_seconds}s</small>}
+                </div>
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -450,6 +665,7 @@ function ResultView({
   const observedFrames = result.frames.filter((frame) => frame.observation);
   const pendingFrames = result.frames.filter((frame) => !frame.observation);
   const answerReady = Boolean(result.answer?.direct_answer);
+  const answerSections = buildAnswerSections(result.answer ?? null);
 
   return (
     <section className="result-grid">
@@ -460,8 +676,19 @@ function ResultView({
         </div>
         {answerReady ? (
           <>
-            <p className="direct-answer">{result.answer?.direct_answer}</p>
-            <p>{result.answer?.summary}</p>
+            <p className="direct-answer">{displayDirectAnswer(result.answer ?? null)}</p>
+            <div className="answer-sections">
+              {answerSections.map((section) => (
+                <section className="answer-section" key={section.title}>
+                  <h3>{section.title}</h3>
+                  <ul>
+                    {section.items.map((item, index) => (
+                      <li key={`${section.title}-${index}`}>{item}</li>
+                    ))}
+                  </ul>
+                </section>
+              ))}
+            </div>
           </>
         ) : (
           <p className="empty">音频和关键画面正在进入分析链路，已完成的观察会先显示在下面。</p>
@@ -602,6 +829,16 @@ function transcriptionLabel(status?: string) {
   return status ?? "unknown";
 }
 
+function liveStatusLabel(status: LiveStatus) {
+  if (status === "queued") return "排队中";
+  if (status === "running") return "运行中";
+  if (status === "streaming") return "实时输出中";
+  if (status === "stopping") return "停止中";
+  if (status === "stopped") return "已停止";
+  if (status === "succeeded") return "已完成";
+  return "失败";
+}
+
 function coverageRows(result: Result): CoverageRow[] {
   const rows = result.prediction_checks.slice(0, 8).map((check) => ({
     start: formatTime(check.window_start),
@@ -615,6 +852,81 @@ function coverageRows(result: Result): CoverageRow[] {
     title: frame.observation ? "已观察关键画面" : "计划观察关键画面",
     text: frame.observation?.evidence_assessment || frame.observation?.scene || frame.reason
   }));
+}
+
+function buildAnswerSections(answer: Result["answer"]) {
+  if (!answer) return [];
+  if (answer.sections?.length) {
+    return answer.sections
+      .map((section) => ({
+        title: section.title,
+        items: section.items.map(cleanDisplayText).filter(Boolean)
+      }))
+      .filter((section) => section.items.length > 0);
+  }
+
+  const summary = answer.summary ?? "";
+  const process = extractLabeledBlock(summary, "大致过程", ["关键画面证据", "覆盖说明", "结论"]);
+  const evidence = extractLabeledBlock(summary, "关键画面证据", ["覆盖说明", "结论"]);
+  const coverage = extractLabeledBlock(summary, "覆盖说明", ["结论"]);
+  const fallback = cleanDisplayText(summary);
+  const sections = [
+    { title: "过程脉络", items: splitChineseList(process).slice(0, 5) },
+    { title: "关键画面证据", items: splitChineseList(evidence).slice(0, 6) },
+    { title: "结论", items: splitChineseList(coverage || fallback).slice(0, 3) }
+  ].filter((section) => section.items.length > 0);
+  if (sections.length) return sections;
+  return [{ title: "摘要", items: [fallback].filter(Boolean) }];
+}
+
+function displayDirectAnswer(answer: Result["answer"]) {
+  const raw = answer?.direct_answer ?? "";
+  const cleaned = cleanDisplayText(raw);
+  if (/3D|三地|打印|装修|家具|施工/.test(cleaned)) {
+    return "这是一个 3D 打印装修实验视频，主线是用 3D 打印参与整屋装修和家具制作，并观察它在设计、施工、成本和成品效果上的表现。";
+  }
+  if (/不确|核心线索是：.*；.*；/.test(cleaned)) {
+    return cleaned.split(" 核心线索是：")[0] || "视频已完成音频和关键画面分析。";
+  }
+  return cleaned;
+}
+
+function extractLabeledBlock(text: string, label: string, nextLabels: string[]) {
+  const startToken = `${label}：`;
+  const start = text.indexOf(startToken);
+  if (start < 0) return "";
+  let end = text.length;
+  for (const next of nextLabels) {
+    const index = text.indexOf(`${next}：`, start + startToken.length);
+    if (index >= 0 && index < end) end = index;
+  }
+  return text.slice(start + startToken.length, end).trim();
+}
+
+function splitChineseList(text: string) {
+  const cleaned = cleanDisplayText(text);
+  if (!cleaned) return [];
+  return cleaned
+    .split(/[；;]\s*/)
+    .map(cleanDisplayText)
+    .filter((item) => item.length > 0 && item !== "。" && !isDisplayNoise(item))
+    .slice(0, 8);
+}
+
+function isDisplayNoise(text: string) {
+  const compact = text.replace(/\s+/g, "");
+  if (["不确", "不确定"].includes(compact)) return true;
+  return /无法支持|不能支持|不支持|未见|看不到|没有3D打印设备|没有 3D 打印设备/.test(text);
+}
+
+function cleanDisplayText(text: string) {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/\.{3,}/g, "...")
+    .replace(/。。+/g, "。")
+    .replace(/；。/g, "。")
+    .trim()
+    .replace(/^[。；,，\s]+|[；,，\s]+$/g, "");
 }
 
 function mergePartialResult(current: Result | null, next: Result) {

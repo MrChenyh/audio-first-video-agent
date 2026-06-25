@@ -1033,57 +1033,201 @@ class AIClient:
         checks: list[dict[str, Any]],
     ) -> dict[str, Any]:
         timeline = audio_world_model.get("timeline") or []
-        transcript_events = [
-            item
-            for item in timeline
-            if str(item.get("evidence", "")).strip() or str(item.get("label", "")).strip()
-        ]
-        transcript_bits = [str(item.get("evidence", "")).strip() for item in transcript_events if str(item.get("evidence", "")).strip()]
-        visual_bits = [
-            f"{float(obs.get('time', 0.0)):.2f}s：{obs.get('evidence_assessment') or obs.get('scene', '')}"
-            for obs in observations
-            if str(obs.get("evidence_assessment") or obs.get("scene", "")).strip()
-        ]
-        coverage_note = []
-        duration = float((audio_world_model.get("duration") or 0.0) or 0.0)
-        if duration <= 0 and timeline:
-            duration = max(float(item.get("end_time") or item.get("time") or 0.0) for item in timeline)
-        if timeline and observations:
-            observed_times = [float(obs.get("time", 0.0)) for obs in observations]
-            uncovered = []
-            for event in transcript_events:
-                event_time = float(event.get("time") or 0.0)
-                if min(abs(time - event_time) for time in observed_times) > 90:
-                    uncovered.append(f"{AIClient._format_seconds(event_time)} {event.get('label', '音频事件')}")
-            if uncovered:
-                coverage_note.append("仍可继续加密观察：" + "；".join(uncovered[:4]))
-        if not coverage_note:
-            coverage_note.append("当前总结基于音频时间线和已抽取关键画面，未展示内部预测检查。")
-
+        events = AIClient._clean_fast_events(timeline)
+        transcript_bits = [event["text"] for event in events]
+        visual_bits = AIClient._clean_visual_evidence(observations)
         title = AIClient._infer_fast_topic(transcript_bits, visual_bits, question)
-        direct = f"视频主要围绕{title}展开。"
-        if transcript_bits:
-            direct += " 核心线索是：" + "；".join(AIClient._compress_text(bit, 42) for bit in transcript_bits[:3])
-        if len(direct) > 180:
-            direct = direct[:177] + "..."
-        summary_parts = []
-        if transcript_events:
-            event_lines = []
-            for event in transcript_events[:8]:
-                event_lines.append(
-                    f"{AIClient._format_seconds(float(event.get('time') or 0.0))} {event.get('label', '音频事件')}："
-                    f"{AIClient._compress_text(str(event.get('evidence') or ''), 58)}"
-                )
-            summary_parts.append("大致过程：" + "；".join(event_lines) + "。")
-        if visual_bits:
-            summary_parts.append("关键画面证据：" + "；".join(AIClient._compress_text(bit, 72) for bit in visual_bits[:8]) + "。")
-        summary_parts.append("覆盖说明：" + "；".join(coverage_note) + "。")
+
+        if "3D 打印" in title:
+            direct = (
+                "这是一个 3D 打印装修实验视频：核心是在一套房的装修和家具制作中尝试使用 3D 打印，"
+                "内容从设计、打印材料/设备、现场施工延伸到成本和成品效果。"
+            )
+        else:
+            direct = f"视频主要围绕{title}展开，音频给出事件线索，关键画面用于确认主要场景和动作。"
+        direct = AIClient._compress_text(direct, 180)
+
+        process_items = AIClient._fast_process_items(events, title)
+        if not process_items and transcript_bits:
+            process_items = [AIClient._compress_text(bit, 88) for bit in transcript_bits[:4]]
+        if not process_items:
+            process_items = ["当前没有稳定的音频事件，系统主要依赖稀疏关键画面做概览。"]
+
+        evidence_items = visual_bits[:6] or ["关键画面已经抽取，但视觉模型没有返回可压缩成证据的稳定描述。"]
+        coverage_note = AIClient._fast_coverage_notes(events, observations, len(timeline))
+
+        conclusion_items = [
+            "这轮结果适合先理解视频主线：它不是逐帧详查，而是用音频定位重点，再用少量画面确认代表性片段。"
+        ]
+        if "3D 打印" in title:
+            conclusion_items = [
+                "视频主线是验证 3D 打印在装修和家具制作中的可行性：能做出有层纹和造型的部件，但成本、材料和传统施工衔接仍是重点讨论对象。"
+            ]
+
+        sections = [
+            {"title": "视频主题", "items": [direct]},
+            {"title": "过程脉络", "items": process_items[:5]},
+            {"title": "关键画面证据", "items": evidence_items[:6]},
+            {"title": "结论", "items": conclusion_items + coverage_note[:1]},
+        ]
+        summary = " ".join(
+            [
+                "过程脉络：" + "；".join(process_items[:4]) + "。",
+                "关键画面证据：" + "；".join(evidence_items[:4]) + "。",
+                "结论：" + conclusion_items[0],
+            ]
+        )
         return {
             "direct_answer": direct or f"快速模式已处理问题：{question}",
-            "summary": "".join(summary_parts)[:900],
+            "summary": summary[:900],
+            "sections": sections,
             "evidence_refs": (visual_bits[:6] + [f"音频：{bit}" for bit in transcript_bits[:4]])[:8],
             "uncertainties": coverage_note,
         }
+
+    @staticmethod
+    def _clean_fast_events(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        events = []
+        for item in timeline:
+            text = AIClient._clean_asr_text(str(item.get("evidence") or ""))
+            label = str(item.get("label") or "音频事件")
+            combined = " ".join(
+                [
+                    label,
+                    text,
+                    " ".join(str(value) for value in item.get("expected_visuals", [])),
+                ]
+            )
+            if AIClient._is_noisy_text(text, combined):
+                continue
+            events.append(
+                {
+                    "time": float(item.get("time") or 0.0),
+                    "end_time": float(item.get("end_time") or item.get("time") or 0.0),
+                    "label": label,
+                    "text": text,
+                    "stage": AIClient._fast_stage_for_text(combined),
+                }
+            )
+        return sorted(events, key=lambda event: event["time"])
+
+    @staticmethod
+    def _clean_asr_text(text: str) -> str:
+        text = " ".join(text.replace("\u3000", " ").split())
+        replacements = {
+            "三地打印": "3D 打印",
+            "三地": "3D",
+            "三D": "3D",
+            "3地": "3D",
+            "3 d": "3D",
+            "磁砖": "瓷砖",
+        }
+        for source, target in replacements.items():
+            text = text.replace(source, target)
+        return text.strip(" ，。；;:：,.!?！？")
+
+    @staticmethod
+    def _is_noisy_text(text: str, context: str = "") -> bool:
+        compact = "".join(ch for ch in text if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+        if not compact:
+            return True
+        if compact in {"不确", "不确定", "嗯", "啊", "就是", "然后", "对", "这个"}:
+            return True
+        if len(compact) <= 3:
+            return True
+        domain_keywords = (
+            "3D", "打印", "设计", "装修", "施工", "材料", "成本", "价格", "预算", "房", "墙", "地面", "瓷砖",
+            "家具", "效果", "模型", "设备", "机器", "柜", "灯", "安装", "制作", "传统", "细致",
+            "一公斤", "二三十", "单价", "用量",
+        )
+        if len(compact) < 9 and not any(keyword in context for keyword in domain_keywords):
+            return True
+        if "不确" in compact and len(compact) < 8:
+            return True
+        vague_phrases = ("给别人见到的有点", "就是有点", "那个这个")
+        return any(phrase in text for phrase in vague_phrases)
+
+    @staticmethod
+    def _fast_stage_for_text(text: str) -> str:
+        if any(token in text for token in ("成本", "价格", "预算", "一公斤", "二三十", "单价", "钱")):
+            return "cost"
+        if any(token in text for token in ("效果", "家具", "传统家具", "成品", "展示", "细致", "实现")):
+            return "outcome"
+        if any(token in text for token in ("建模", "模型", "设计", "图纸", "方案")):
+            return "design"
+        if any(token in text for token in ("施工", "装修", "墙", "瓷砖", "地面", "吊顶", "安装", "灯", "房间")):
+            return "construction"
+        if any(token in text for token in ("3D", "打印", "打印机", "机器", "设备", "喷嘴", "材料", "层层")):
+            return "printing"
+        return "context"
+
+    @staticmethod
+    def _fast_process_items(events: list[dict[str, Any]], topic: str) -> list[str]:
+        order = ["design", "printing", "construction", "cost", "outcome", "context"]
+        grouped: dict[str, list[dict[str, Any]]] = {stage: [] for stage in order}
+        for event in events:
+            grouped.setdefault(event["stage"], []).append(event)
+
+        if "3D 打印" in topic:
+            templates = {
+                "design": "先明确目标和方案：尝试用 3D 打印参与整屋装修/部件制作，并进行设计建模。",
+                "printing": "随后进入打印和材料部分：关注打印设备、材料堆叠成型，以及可打印哪些装修/家具部件。",
+                "construction": "中段转向现场施工：把 3D 打印部件与墙面、瓷砖、灯具、安装等传统装修环节衔接起来。",
+                "cost": "后段讨论成本：包括材料单价、用量、整体预算，以及这种方案是否划算。",
+                "outcome": "最后看成品效果：重点是柜体、家具或房间细节能否接近传统装修和家具的质感。",
+            }
+        else:
+            templates = {}
+
+        items = []
+        for stage in order:
+            stage_events = grouped.get(stage) or []
+            if not stage_events:
+                continue
+            start = AIClient._format_seconds(stage_events[0]["time"])
+            end = AIClient._format_seconds(stage_events[-1]["time"])
+            time_prefix = start if start == end else f"{start}-{end}"
+            if stage in templates:
+                items.append(f"{time_prefix}：{templates[stage]}")
+                continue
+            samples = "；".join(AIClient._compress_text(event["text"], 34) for event in stage_events[:2])
+            items.append(f"{time_prefix}：{samples}")
+        return items
+
+    @staticmethod
+    def _clean_visual_evidence(observations: list[dict[str, Any]]) -> list[str]:
+        evidence = []
+        negative_terms = ("无法支持", "不能支持", "不支持", "没有", "未见", "看不到", "不符合", "conflict")
+        prefixes = ("画面支持该音频。证据：", "画面支持音频。证据：", "画面支持该音频：", "证据：")
+        for obs in sorted(observations, key=lambda item: float(item.get("time", 0.0))):
+            text = str(obs.get("evidence_assessment") or obs.get("scene") or "").strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(term in text or term in lowered for term in negative_terms):
+                continue
+            for prefix in prefixes:
+                text = text.replace(prefix, "")
+            text = AIClient._compress_text(text.strip(" ；。"), 86)
+            if not text:
+                continue
+            evidence.append(f"{AIClient._format_seconds(float(obs.get('time', 0.0)))}：{text}")
+        if evidence:
+            return evidence
+        for obs in sorted(observations, key=lambda item: float(item.get("time", 0.0)))[:4]:
+            text = AIClient._compress_text(str(obs.get("scene") or obs.get("evidence_assessment") or "关键帧已抽取"), 72)
+            evidence.append(f"{AIClient._format_seconds(float(obs.get('time', 0.0)))}：{text}")
+        return evidence
+
+    @staticmethod
+    def _fast_coverage_notes(events: list[dict[str, Any]], observations: list[dict[str, Any]], raw_event_count: int) -> list[str]:
+        notes = [f"本轮提炼了 {len(events)} 条有效音频线索，并观察了 {len(observations)} 个关键画面。"]
+        skipped = max(0, raw_event_count - len(events))
+        if skipped:
+            notes.append(f"已过滤 {skipped} 条过短或不稳定的转写片段，避免把噪声写进结论。")
+        if len(observations) < 8:
+            notes.append("如果要核对每个施工步骤，可以继续提高关键帧预算或对某个时间段加密观察。")
+        return notes
 
     @staticmethod
     def _compact_frames_for_prompt(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:

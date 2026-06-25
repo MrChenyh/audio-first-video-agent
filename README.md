@@ -27,6 +27,7 @@ flowchart LR
 - 本地优先存储：视频、音频、帧、状态和 SQLite 都保存在本地 `data/`，默认不上传到仓库。
 - 可降级转写：API 转写不可用时，可使用本地 faster-whisper 模型。
 - Web 工作台：React/Vite 前端展示进度、音频时间线、关键帧证据、覆盖情况、最终答案和多轮追问。
+- 直播分析：直播 URL 或 m3u8/flv 直链会进入独立 Live Session，按短窗口实时切片、转写、抽关键帧并推送分段总结。
 - URL 输入：直链 mp4/webm/mov 可直接下载；站点页面链接可通过 `yt-dlp` 下载后进入同一条分析链路。
 
 ## 技术栈
@@ -176,6 +177,31 @@ pnpm dev
 - `POST /api/jobs/{job_id}/ask`：基于已保存 state/result 继续追问
 - `GET /api/jobs/{job_id}/frames/{filename}`：读取抽取的帧图片
 - `GET /api/jobs/{job_id}/source`：读取上传或下载后的源视频，用于前端预览
+- `POST /api/live/sessions`：创建直播分析 session，支持 `{url, question, window_seconds, max_segments}`
+- `GET /api/live/sessions/{session_id}`：查询直播 session 当前状态和分段结果
+- `GET /api/live/sessions/{session_id}/events`：SSE 实时推送直播分段总结
+- `POST /api/live/sessions/{session_id}/stop`：停止直播分析
+- `GET /api/live/{session_id}/frames/{filename}`：读取直播短窗口关键帧
+
+## 直播分析
+
+直播分析和上传视频分析是两条独立链路。上传视频会跑完整 LangGraph job；直播分析更像一个持续运行的采样器：
+
+1. 解析直播 URL。直链 `m3u8/flv/mp4` 直接使用；抖音直播页面会尝试从 HTML 中提取 `hls_pull_url` / `flv_pull_url`。
+2. FFmpeg 每 `LIVE_WINDOW_SECONDS` 秒捕获一个短视频窗口。
+3. 每个窗口抽音频、转写、抽中点关键帧。
+4. 用 JoyAI 或当前视觉模型观察该关键帧。
+5. 通过 SSE 把该段的音频、画面证据和一句实时总结推到前端。
+
+配置项：
+
+```env
+LIVE_WINDOW_SECONDS=4
+LIVE_MAX_SEGMENTS=0
+LIVE_SEGMENT_TIMEOUT_SECONDS=18
+```
+
+`LIVE_MAX_SEGMENTS=0` 表示持续分析；调试时可以在前端填 `1` 或 `3`，先快速验证直播流是否可解析。实测 `https://live.douyin.com/547977714661` 能解析出 HLS 并完成 3 秒窗口分析：端到端约 8.8 秒，包含本地 faster-whisper 转写和 JoyAI 关键帧观察。若某个直播间需要登录态或 cookie，可粘贴已经获取到的 m3u8/flv 直链。
 
 ## Agent 工作流
 

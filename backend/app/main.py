@@ -15,12 +15,14 @@ from pydantic import BaseModel
 
 from .ai import AIClient
 from .config import load_settings
+from .live import LiveSessionManager
 from .runner import JobRunner
 from .storage import JobStore
 
 settings = load_settings()
 store = JobStore(settings.data_dir)
 runner = JobRunner(settings, store)
+live_manager = LiveSessionManager(settings, store)
 
 app = FastAPI(title="Audio-First Video Understanding Agent")
 
@@ -32,6 +34,13 @@ class UrlJobRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str
+
+
+class LiveSessionRequest(BaseModel):
+    url: str
+    question: str = "实时总结直播中正在发生什么，关注主播动作、商品/场景变化、屏幕文字和语音重点。"
+    window_seconds: float | None = None
+    max_segments: int | None = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,6 +65,73 @@ def health() -> dict[str, object]:
         "vision_provider": settings.vision_provider,
         "data_dir": str(settings.data_dir),
     }
+
+
+@app.post("/api/live/sessions")
+def create_live_session(request: LiveSessionRequest) -> dict[str, str]:
+    url = request.url.strip()
+    question = request.question.strip() or "实时总结直播中正在发生什么。"
+    if not _is_http_url(url):
+        raise HTTPException(status_code=400, detail="Only http:// and https:// live URLs are supported.")
+    session_id = uuid4().hex
+    live_manager.create_session(
+        session_id=session_id,
+        source_url=url,
+        question=question,
+        max_segments=request.max_segments,
+        window_seconds=request.window_seconds,
+    )
+    return {"session_id": session_id}
+
+
+@app.get("/api/live/sessions/{session_id}")
+def get_live_session(session_id: str) -> dict[str, object]:
+    payload = live_manager.public_session(session_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Live session not found.")
+    return payload
+
+
+@app.post("/api/live/sessions/{session_id}/stop")
+def stop_live_session(session_id: str) -> dict[str, object]:
+    if not live_manager.stop_session(session_id):
+        raise HTTPException(status_code=404, detail="Live session not found.")
+    return {"ok": True, "session_id": session_id}
+
+
+@app.get("/api/live/sessions/{session_id}/events")
+async def live_session_events(session_id: str) -> StreamingResponse:
+    if not live_manager.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Live session not found.")
+
+    async def stream():
+        last_payload: str | None = None
+        while True:
+            payload_obj = live_manager.public_session(session_id)
+            if not payload_obj:
+                break
+            payload = json.dumps(payload_obj, ensure_ascii=False)
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+            if payload_obj["status"] in {"succeeded", "failed", "stopped"}:
+                break
+            await asyncio.sleep(0.8)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.get("/api/live/{session_id}/frames/{filename}")
+def get_live_frame(session_id: str, filename: str) -> FileResponse:
+    session_dir = (settings.data_dir / "live" / session_id).resolve()
+    frame_path = (session_dir / filename).resolve()
+    try:
+        frame_path.relative_to(session_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Frame not found.") from exc
+    if not frame_path.exists():
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    return FileResponse(frame_path)
 
 
 @app.post("/api/jobs")

@@ -58,6 +58,9 @@ class Settings:
     local_transcribe_first: bool
     local_transcribe_fallback: bool
     local_transcribe_model: str
+    live_window_seconds: float
+    live_max_segments: int
+    live_segment_timeout_seconds: float
     cors_origins: tuple[str, ...]
 
     @property
@@ -121,5 +124,8 @@ def load_settings() -> Settings:
         local_transcribe_first=_bool_env(os.getenv("LOCAL_TRANSCRIBE_FIRST"), False),
         local_transcribe_fallback=_bool_env(os.getenv("LOCAL_TRANSCRIBE_FALLBACK"), True),
         local_transcribe_model=os.getenv("LOCAL_TRANSCRIBE_MODEL", "tiny"),
+        live_window_seconds=max(1.0, float(os.getenv("LIVE_WINDOW_SECONDS", "4"))),
+        live_max_segments=max(0, int(os.getenv("LIVE_MAX_SEGMENTS", "0"))),
+        live_segment_timeout_seconds=max(5.0, float(os.getenv("LIVE_SEGMENT_TIMEOUT_SECONDS", "18"))),
         cors_origins=cors_origins,
     )

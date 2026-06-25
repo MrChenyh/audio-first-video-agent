@@ -49,6 +49,9 @@ def make_settings(tmp_path: Path) -> Settings:
         local_transcribe_first=False,
         local_transcribe_fallback=True,
         local_transcribe_model="tiny",
+        live_window_seconds=4,
+        live_max_segments=0,
+        live_segment_timeout_seconds=18,
         cors_origins=("http://127.0.0.1:5173",),
     )
 
