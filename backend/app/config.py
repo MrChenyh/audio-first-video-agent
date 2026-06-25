@@ -61,6 +61,8 @@ class Settings:
     live_window_seconds: float
     live_max_segments: int
     live_segment_timeout_seconds: float
+    live_fast_capture: bool
+    live_frame_width: int
     cors_origins: tuple[str, ...]
 
     @property
@@ -127,5 +129,7 @@ def load_settings() -> Settings:
         live_window_seconds=max(1.0, float(os.getenv("LIVE_WINDOW_SECONDS", "4"))),
         live_max_segments=max(0, int(os.getenv("LIVE_MAX_SEGMENTS", "0"))),
         live_segment_timeout_seconds=max(5.0, float(os.getenv("LIVE_SEGMENT_TIMEOUT_SECONDS", "18"))),
+        live_fast_capture=_bool_env(os.getenv("LIVE_FAST_CAPTURE"), True),
+        live_frame_width=max(160, int(os.getenv("LIVE_FRAME_WIDTH", "640"))),
         cors_origins=cors_origins,
     )

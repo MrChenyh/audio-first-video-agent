@@ -150,6 +150,13 @@ type LiveSegment = {
   transcript?: string;
   summary: string;
   elapsed_seconds?: number;
+  transcript_seconds?: number;
+  vision_seconds?: number;
+  analysis_seconds?: number;
+  capture?: {
+    mode?: string;
+    capture_seconds?: number;
+  };
   frame?: {
     time: number;
     filename: string;
@@ -206,7 +213,7 @@ export function App() {
   const [asking, setAsking] = useState(false);
   const [liveUrl, setLiveUrl] = useState("https://live.douyin.com/547977714661");
   const [liveQuestion, setLiveQuestion] = useState("实时总结直播中正在发生什么，关注主播动作、商品/场景变化、屏幕文字和语音重点。");
-  const [liveWindow, setLiveWindow] = useState(4);
+  const [liveWindow, setLiveWindow] = useState(2);
   const [liveMaxSegments, setLiveMaxSegments] = useState(0);
   const [liveSubmitting, setLiveSubmitting] = useState(false);
   const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
@@ -597,7 +604,7 @@ function LiveWorkbench({
         <div className="live-controls">
           <label>
             <span>窗口秒数</span>
-            <input type="number" min={2} max={12} value={liveWindow} onChange={(event) => setLiveWindow(Number(event.target.value) || 4)} />
+            <input type="number" min={1} max={12} value={liveWindow} onChange={(event) => setLiveWindow(Number(event.target.value) || 2)} />
           </label>
           <label>
             <span>最大段数</span>
@@ -611,7 +618,7 @@ function LiveWorkbench({
             <button className="secondary-action" type="button" onClick={stopLive}>停止</button>
           )}
         </div>
-        <small>最大段数填 0 表示持续分析。抖音页面会尝试解析真实 m3u8/flv；如果页面需要登录/cookie，可直接粘贴 m3u8/flv 直链。</small>
+        <small>最大段数填 0 表示持续分析。低延迟模式会直接从直播流同时抓音频和关键帧；第一段是冷启动，后续段会复用转写和视觉会话。</small>
       </form>
       {liveError && (
         <div className="error-line" role="alert">
@@ -636,7 +643,7 @@ function LiveWorkbench({
                   <h3>{formatTime(segment.start_time)} - {formatTime(segment.end_time)}</h3>
                   <p>{segment.summary}</p>
                   {segment.transcript && <small>音频：{segment.transcript}</small>}
-                  {segment.elapsed_seconds !== undefined && <small>处理耗时 {segment.elapsed_seconds}s</small>}
+                  <small>{liveLatencyText(segment)}</small>
                 </div>
               </article>
             ))}
@@ -837,6 +844,16 @@ function liveStatusLabel(status: LiveStatus) {
   if (status === "stopped") return "已停止";
   if (status === "succeeded") return "已完成";
   return "失败";
+}
+
+function liveLatencyText(segment: LiveSegment) {
+  const parts = [];
+  if (segment.elapsed_seconds !== undefined) parts.push(`总 ${segment.elapsed_seconds}s`);
+  if (segment.capture?.capture_seconds !== undefined) parts.push(`捕获 ${segment.capture.capture_seconds}s`);
+  if (segment.transcript_seconds !== undefined) parts.push(`转写 ${segment.transcript_seconds}s`);
+  if (segment.vision_seconds !== undefined) parts.push(`视觉 ${segment.vision_seconds}s`);
+  if (segment.capture?.mode) parts.push(segment.capture.mode === "fast" ? "低延迟捕获" : "兼容捕获");
+  return parts.length ? parts.join(" / ") : "等待耗时统计";
 }
 
 function coverageRows(result: Result): CoverageRow[] {

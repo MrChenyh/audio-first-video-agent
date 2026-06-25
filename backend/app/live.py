@@ -152,6 +152,161 @@ class LiveSessionManager:
         window_seconds: float,
     ) -> dict[str, Any]:
         self._mark(session, current_node=f"capture_segment {segment_index + 1}")
+        capture_started = time.time()
+        if self.settings.live_fast_capture:
+            audio_path, frame_path, capture_info = self._capture_fast_audio_and_frame(
+                ffmpeg=ffmpeg,
+                source_url=source_url,
+                session_dir=session_dir,
+                segment_index=segment_index,
+                window_seconds=window_seconds,
+            )
+        else:
+            audio_path, frame_path, capture_info = self._capture_compat_segment(
+                processor=processor,
+                ffmpeg=ffmpeg,
+                source_url=source_url,
+                session_dir=session_dir,
+                segment_index=segment_index,
+                window_seconds=window_seconds,
+            )
+        capture_info["capture_seconds"] = round(time.time() - capture_started, 2)
+
+        self._mark(session, current_node=f"analyze_segment {segment_index + 1}")
+        analysis_started = time.time()
+        transcript_started = time.time()
+        transcript_segments = ai.transcribe(audio_path, window_seconds)
+        transcript_seconds = round(time.time() - transcript_started, 2)
+        transcript_text = " ".join(str(item.get("text", "")).strip() for item in transcript_segments if item.get("text"))
+        frame_time = capture_info.get("frame_time", max(0.1, window_seconds / 2))
+        frame = {
+            "time": segment_index * window_seconds + frame_time,
+            "filename": frame_path.name,
+            "path": str(frame_path),
+            "url": f"/api/live/{session.session_id}/frames/{frame_path.name}",
+            "reason": "live segment midpoint evidence",
+            "probe": {
+                "type": "live_segment",
+                "question": session.question,
+                "expected_visuals": ["直播画面主体", "可见动作", "屏幕文字", "商品或场景变化"],
+            },
+        }
+        world_model = {
+            "timeline": [
+                {
+                    "time": frame["time"],
+                    "end_time": frame["time"] + window_seconds,
+                    "label": "直播窗口",
+                    "evidence": transcript_text,
+                    "expected_visuals": ["直播画面主体", "可见动作", "屏幕文字"],
+                    "visual_question": session.question,
+                }
+            ]
+        }
+        vision_started = time.time()
+        observations = ai.observe_frames(
+            question=session.question,
+            frames=[frame],
+            audio_world_model=world_model,
+            session_id=f"live-{session.session_id}",
+        )
+        vision_seconds = round(time.time() - vision_started, 2)
+        observation = observations[0] if observations else {}
+        summary = summarize_live_segment(
+            index=segment_index,
+            start_time=segment_index * window_seconds,
+            transcript=transcript_text,
+            observation=observation,
+            question=session.question,
+        )
+        return {
+            "index": segment_index,
+            "start_time": round(segment_index * window_seconds, 2),
+            "end_time": round((segment_index + 1) * window_seconds, 2),
+            "transcript": transcript_text,
+            "frame": {k: frame[k] for k in ["time", "filename", "url", "reason"]},
+            "observation": observation,
+            "summary": summary,
+            "transcription_status": ai.last_transcription_status,
+            "capture": capture_info,
+            "analysis_seconds": round(time.time() - analysis_started, 2),
+            "transcript_seconds": transcript_seconds,
+            "vision_seconds": vision_seconds,
+        }
+
+    def _capture_fast_audio_and_frame(
+        self,
+        *,
+        ffmpeg: str,
+        source_url: str,
+        session_dir: Path,
+        segment_index: int,
+        window_seconds: float,
+    ) -> tuple[Path, Path, dict[str, Any]]:
+        audio_path = session_dir / f"segment_{segment_index:05d}.wav"
+        frame_path = session_dir / f"segment_{segment_index:05d}.jpg"
+        frame_time = max(0.1, window_seconds / 2)
+        audio_command = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-rw_timeout",
+            str(int(self.settings.live_segment_timeout_seconds * 1_000_000)),
+            "-i",
+            source_url,
+            "-t",
+            f"{window_seconds:.2f}",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(audio_path),
+        ]
+        frame_command = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-rw_timeout",
+            str(int(self.settings.live_segment_timeout_seconds * 1_000_000)),
+            "-ss",
+            f"{frame_time:.2f}",
+            "-i",
+            source_url,
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={self.settings.live_frame_width}:-2",
+            "-q:v",
+            "3",
+            str(frame_path),
+        ]
+        timeout = self.settings.live_segment_timeout_seconds + window_seconds + 8
+        audio_proc = subprocess.Popen(audio_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        frame_proc = subprocess.Popen(frame_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        audio_stdout, audio_stderr = audio_proc.communicate(timeout=timeout)
+        frame_stdout, frame_stderr = frame_proc.communicate(timeout=timeout)
+        _ = (audio_stdout, frame_stdout)
+        if audio_proc.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
+            raise RuntimeError(f"Live audio capture failed: {audio_stderr.strip()}")
+        if frame_proc.returncode != 0 or not frame_path.exists() or frame_path.stat().st_size == 0:
+            raise RuntimeError(f"Live frame capture failed: {frame_stderr.strip()}")
+        return audio_path, frame_path, {"mode": "fast", "frame_time": frame_time}
+
+    def _capture_compat_segment(
+        self,
+        *,
+        processor: VideoProcessor,
+        ffmpeg: str,
+        source_url: str,
+        session_dir: Path,
+        segment_index: int,
+        window_seconds: float,
+    ) -> tuple[Path, Path, dict[str, Any]]:
         segment_path = session_dir / f"segment_{segment_index:05d}.mp4"
         command = [
             ffmpeg,
@@ -180,65 +335,20 @@ class LiveSessionManager:
         )
         if completed.returncode != 0 or not segment_path.exists() or segment_path.stat().st_size == 0:
             raise RuntimeError(f"Live segment capture failed: {completed.stderr.strip()}")
-
         has_audio = True
         try:
             metadata = processor.probe_video(segment_path)
             has_audio = bool(metadata.get("has_audio", True))
         except Exception:
             metadata = {"duration_seconds": window_seconds, "has_audio": True}
-
-        self._mark(session, current_node=f"analyze_segment {segment_index + 1}")
         audio_path = session_dir / f"segment_{segment_index:05d}.wav"
         extracted_audio = processor.extract_audio(segment_path, audio_path, has_audio)
-        transcript_segments = ai.transcribe(extracted_audio, float(metadata.get("duration_seconds", window_seconds)))
-        transcript_text = " ".join(str(item.get("text", "")).strip() for item in transcript_segments if item.get("text"))
-
+        if extracted_audio is None:
+            raise RuntimeError("Live segment did not include an audio track.")
         frame_path = session_dir / f"segment_{segment_index:05d}.jpg"
         frame_time = min(max(0.1, window_seconds / 2), max(0.1, float(metadata.get("duration_seconds", window_seconds)) - 0.1))
         processor.extract_frame(segment_path, frame_time, frame_path)
-        frame = {
-            "time": segment_index * window_seconds + frame_time,
-            "filename": frame_path.name,
-            "path": str(frame_path),
-            "url": f"/api/live/{session.session_id}/frames/{frame_path.name}",
-            "reason": "live segment midpoint evidence",
-            "probe": {
-                "question": session.question,
-                "expected_visuals": ["直播画面主体", "可见动作", "屏幕文字", "商品或场景变化"],
-            },
-        }
-        world_model = {
-            "timeline": [
-                {
-                    "time": frame["time"],
-                    "end_time": frame["time"] + window_seconds,
-                    "label": "直播窗口",
-                    "evidence": transcript_text,
-                    "expected_visuals": ["直播画面主体", "可见动作", "屏幕文字"],
-                    "visual_question": session.question,
-                }
-            ]
-        }
-        observations = ai.observe_frames(question=session.question, frames=[frame], audio_world_model=world_model)
-        observation = observations[0] if observations else {}
-        summary = summarize_live_segment(
-            index=segment_index,
-            start_time=segment_index * window_seconds,
-            transcript=transcript_text,
-            observation=observation,
-            question=session.question,
-        )
-        return {
-            "index": segment_index,
-            "start_time": round(segment_index * window_seconds, 2),
-            "end_time": round((segment_index + 1) * window_seconds, 2),
-            "transcript": transcript_text,
-            "frame": {k: frame[k] for k in ["time", "filename", "url", "reason"]},
-            "observation": observation,
-            "summary": summary,
-            "transcription_status": ai.last_transcription_status,
-        }
+        return extracted_audio, frame_path, {"mode": "compat", "frame_time": frame_time, "segment_path": str(segment_path)}
 
     def _mark(
         self,

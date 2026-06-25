@@ -15,6 +15,8 @@ class AIClient:
         self.settings = settings
         self.mock = settings.use_mock_models
         self._client = None
+        self._joyai_client = None
+        self._local_whisper_cache: dict[str, Any] = {}
         self.last_transcription_status: dict[str, Any] = {}
         self.last_vision_request_count = 0
         if not self.mock:
@@ -278,6 +280,7 @@ class AIClient:
         question: str,
         frames: list[dict[str, Any]],
         audio_world_model: dict[str, Any],
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self.last_vision_request_count = 0
         if self.mock:
@@ -308,6 +311,7 @@ class AIClient:
                     question=question,
                     frames=frames,
                     audio_world_model=audio_world_model,
+                    session_id=session_id,
                 )
                 self.last_vision_request_count = len(frames)
                 return observations
@@ -426,31 +430,45 @@ class AIClient:
         question: str,
         frames: list[dict[str, Any]],
         audio_world_model: dict[str, Any],
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=self.settings.joyai_api_key,
-            base_url=self.settings.joyai_api_base,
-            timeout=self.settings.joyai_timeout_seconds,
-            max_retries=0,
-        )
+        if self._joyai_client is None:
+            self._joyai_client = OpenAI(
+                api_key=self.settings.joyai_api_key,
+                base_url=self.settings.joyai_api_base,
+                timeout=self.settings.joyai_timeout_seconds,
+                max_retries=0,
+            )
+        client = self._joyai_client
         observations: list[dict[str, Any]] = []
         for index, frame in enumerate(frames):
             target = str((frame.get("probe") or {}).get("question") or frame.get("reason") or question)
             audio_context = self._audio_context_for_time(audio_world_model, float(frame["time"]))
-            session_id = f"audio-first-{int(time.time() * 1000)}-{index}"
-            prompt = (
-                "You are the fast local visual verifier inside an audio-first video agent. "
-                "Do not give a generic caption. Verify the audio-guided target for the current frame. "
-                "This is image QA, not passive live monitoring. You must not output </silence>. "
-                "Always answer with </response> followed by concise Chinese visible evidence. Include visible objects, "
-                "actions, text/symbols, and whether the frame matches, conflicts with, or is uncertain for the target.\n"
-                f"User question: {question}\n"
-                f"Frame time: {float(frame['time']):.2f}s\n"
-                f"Audio context near this frame: {audio_context}\n"
-                f"Visual target to verify: {target}"
-            )
+            frame_session_id = session_id or f"audio-first-{int(time.time() * 1000)}-{index}"
+            is_live = (frame.get("probe") or {}).get("type") == "live_segment"
+            if is_live:
+                prompt = (
+                    "</response> 用中文用一句话概括直播当前画面。只说可见主体、动作、屏幕文字/商品/场景，"
+                    "不要解释流程，不要输出无关字幕。\n"
+                    f"问题: {target}\n"
+                    f"音频: {audio_context}"
+                )
+                max_tokens = 56
+            else:
+                prompt = (
+                    "You are the fast local visual verifier inside an audio-first video agent. "
+                    "Do not give a generic caption. Verify the audio-guided target for the current frame. "
+                    "This is image QA, not passive live monitoring. You must not output </silence>. "
+                    "Always answer with </response> followed by concise Chinese visible evidence. Include visible objects, "
+                    "actions, text/symbols, and whether the frame matches, conflicts with, or is uncertain for the target.\n"
+                    f"User question: {question}\n"
+                    f"Frame time: {float(frame['time']):.2f}s\n"
+                    f"Audio context near this frame: {audio_context}\n"
+                    f"Visual target to verify: {target}"
+                )
+                max_tokens = 96
             response = client.chat.completions.create(
                 model=self.settings.joyai_model,
                 messages=[
@@ -465,10 +483,10 @@ class AIClient:
                         ],
                     }
                 ],
-                max_tokens=96,
+                max_tokens=max_tokens,
                 temperature=0,
                 extra_headers={
-                    "x-streaming-session": session_id,
+                    "x-streaming-session": frame_session_id,
                     "x-frame-time-range": f"{float(frame['time']):.2f}s-{float(frame['time']) + 1.0:.2f}s",
                 },
             )
@@ -1424,7 +1442,11 @@ class AIClient:
         try:
             from faster_whisper import WhisperModel
 
-            model = WhisperModel(model_ref, device="cpu", compute_type="int8")
+            model = self._local_whisper_cache.get(model_ref)
+            cache_hit = model is not None
+            if model is None:
+                model = WhisperModel(model_ref, device="cpu", compute_type="int8")
+                self._local_whisper_cache[model_ref] = model
             segments, info = model.transcribe(str(audio_path), vad_filter=True, beam_size=5)
             language = getattr(info, "language", "unknown")
             language_probability = getattr(info, "language_probability", None)
@@ -1450,6 +1472,7 @@ class AIClient:
                 "language": language,
                 "language_probability": language_probability,
                 "segment_count": len(normalized),
+                "cache_hit": cache_hit,
             }
         except Exception as exc:
             status = {

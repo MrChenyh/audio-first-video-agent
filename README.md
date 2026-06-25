@@ -196,12 +196,16 @@ pnpm dev
 配置项：
 
 ```env
-LIVE_WINDOW_SECONDS=4
+LIVE_WINDOW_SECONDS=2
 LIVE_MAX_SEGMENTS=0
 LIVE_SEGMENT_TIMEOUT_SECONDS=18
+LIVE_FAST_CAPTURE=true
+LIVE_FRAME_WIDTH=640
 ```
 
-`LIVE_MAX_SEGMENTS=0` 表示持续分析；调试时可以在前端填 `1` 或 `3`，先快速验证直播流是否可解析。实测 `https://live.douyin.com/547977714661` 能解析出 HLS 并完成 3 秒窗口分析：端到端约 8.8 秒，包含本地 faster-whisper 转写和 JoyAI 关键帧观察。若某个直播间需要登录态或 cookie，可粘贴已经获取到的 m3u8/flv 直链。
+`LIVE_FAST_CAPTURE=true` 会跳过“先录 mp4 再拆音频/抽帧”的兼容路径，改为 FFmpeg 直接从直播流并行抓 16k WAV 和中点 JPEG，减少一次落盘、一次 probe 和两次二次处理。`LIVE_FRAME_WIDTH=640` 会把直播关键帧缩到适合低延迟视觉理解的宽度。`LIVE_MAX_SEGMENTS=0` 表示持续分析；调试时可以在前端填 `1` 或 `3`，先快速验证直播流是否可解析。
+
+实测 `https://live.douyin.com/547977714661`：旧版兼容路径 3 秒窗口端到端约 8.8 秒；低延迟捕获 + 缓存 faster-whisper/JoyAI client 后，2 秒窗口第一段冷启动约 7.08 秒，第二段热启动约 1.56 秒，其中转写约 0.72 秒、视觉约 0.64 秒。这才更接近 JoyAI/流式监控模型宣传的“压秒级”使用方式。若某个直播间需要登录态或 cookie，可粘贴已经获取到的 m3u8/flv 直链。
 
 ## Agent 工作流
 
