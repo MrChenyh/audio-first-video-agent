@@ -21,10 +21,23 @@ def main() -> None:
     )
     parser.add_argument("--uniform-samples", type=int, default=12)
     parser.add_argument("--tolerance", type=float, default=4.0, help="Seconds for temporal hit recall.")
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        nargs="+",
+        default=[0.2, 0.5, 1.0, 2.0],
+        help="Whole-video/model-internal frame sampling rates to estimate visual-token cost.",
+    )
+    parser.add_argument(
+        "--tokens-per-frame",
+        type=int,
+        default=256,
+        help="Normalized visual token units per sampled frame for rough cross-method cost comparison.",
+    )
     args = parser.parse_args()
 
     report = json.loads(args.report.read_text(encoding="utf-8"))
-    print(render_summary(report, args.uniform_samples, args.tolerance))
+    print(render_summary(report, args.uniform_samples, args.tolerance, args.video_fps, args.tokens_per_frame))
 
 
 def latest_report() -> Path:
@@ -34,7 +47,13 @@ def latest_report() -> Path:
     return reports[-1]
 
 
-def render_summary(report: dict[str, Any], uniform_samples: int, tolerance: float) -> str:
+def render_summary(
+    report: dict[str, Any],
+    uniform_samples: int,
+    tolerance: float,
+    video_fps_values: list[float],
+    tokens_per_frame: int,
+) -> str:
     summary = report["summary"]
     rows = report["rows"]
     whole_rows = report.get("whole_rows") or []
@@ -51,6 +70,9 @@ def render_summary(report: dict[str, Any], uniform_samples: int, tolerance: floa
     whole = summary.get("whole", {})
     clip4_watch_seconds = len(unique_points) * 4.0
     clip2_watch_seconds = len(unique_points) * 2.0
+    clip2_units = visual_units_for_seconds(clip2_watch_seconds, 1.0)
+    clip4_units = visual_units_for_seconds(clip4_watch_seconds, 1.0)
+    uniform_units = len(report["videos"]) * uniform_samples
 
     lines = ["# Method Comparison Summary", ""]
     lines.append(f"Benchmark run: `{report['run_id']}`")
@@ -95,6 +117,46 @@ def render_summary(report: dict[str, Any], uniform_samples: int, tolerance: floa
     lines.append(f"- Uniform sampling needed to guarantee +/-4s coverage over these videos: about {guaranteed_4s} frames.")
     lines.append(f"- Audio-first 4s clips watched {clip4_watch_seconds:.0f}s out of {total_duration:.0f}s ({clip4_watch_seconds / total_duration:.2%}).")
     lines.append("")
+    lines.append("## Multimodal Video Cost Estimate")
+    lines.append(
+        "These are normalized visual-token estimates, not vendor billing numbers. "
+        f"Assumption: 1 sampled video frame = {tokens_per_frame} visual token units."
+    )
+    lines.append("")
+    lines.append("| Input strategy | Sampled visual units | Token units | Reduction vs audio-first 4s clips | Observed/expected quality |")
+    lines.append("|---|---:|---:|---:|---|")
+    lines.append(
+        f"| Uniform sparse {uniform_samples} frames/video | {uniform_units} frames | {uniform_units * tokens_per_frame:,} | "
+        f"{reduction(uniform_units, clip4_units):.1%} | Temporal recall {uniform_recall['recall']:.1%}; most key moments missed. |"
+    )
+    lines.append(
+        f"| Audio-first 2s clips @1fps-equivalent | {clip2_units} frames | {clip2_units * tokens_per_frame:,} | "
+        f"{reduction(clip2_units, clip4_units):.1%} | Observed avg score {clip2.get('avg_score', 0)}, Pass@0.67 {clip2.get('pass_rate_0_67', 0)}. |"
+    )
+    lines.append(
+        f"| Audio-first 4s clips @1fps-equivalent | {clip4_units} frames | {clip4_units * tokens_per_frame:,} | baseline | "
+        f"Observed avg score {clip4.get('avg_score', 0)}, Pass@0.67 {clip4.get('pass_rate_0_67', 0)}. |"
+    )
+    for fps in video_fps_values:
+        units = visual_units_for_seconds(total_duration, fps)
+        lines.append(
+            f"| Whole video direct/model-internal sampling @{fps:g}fps | {units} frames | {units * tokens_per_frame:,} | "
+            f"{reduction(units, clip4_units):.1%} | Whole-video low-res observed avg score {whole.get('avg_score', 0)}; detail reliability varied by video. |"
+        )
+    lines.append("")
+    lines.append("### Cost Takeaways")
+    for fps in video_fps_values:
+        units = visual_units_for_seconds(total_duration, fps)
+        if fps in {0.5, 1.0, 2.0}:
+            lines.append(
+                f"- Compared with whole-video @{fps:g}fps sampling, audio-first 4s clips reduce visual-token units by "
+                f"{reduction(units, clip4_units):.1%} ({units} -> {clip4_units} frame-units)."
+            )
+    lines.append(
+        f"- The measured accuracy moved in the opposite direction: whole low-res scan avg score {whole.get('avg_score', 0)}, "
+        f"audio-first 4s clips avg score {clip4.get('avg_score', 0)}."
+    )
+    lines.append("")
     lines.append("## Whole-Video Scan Rows")
     for row in whole_rows:
         lines.append(f"- {row['video_id']}: score={row['score']}, latency={row['elapsed_s']}s, encode={row['encode_s']}s, matched={', '.join(row.get('matched_keywords') or [])}")
@@ -126,6 +188,16 @@ def avg_whole_payload(rows: list[dict[str, Any]]) -> float:
     if not rows:
         return 0.0
     return round(sum(float(row.get("media_size_kb") or 0.0) for row in rows) / len(rows), 1)
+
+
+def visual_units_for_seconds(seconds: float, fps: float) -> int:
+    return max(1, int(seconds * fps + 0.999))
+
+
+def reduction(reference_units: int, candidate_units: int) -> float:
+    if reference_units <= 0:
+        return 0.0
+    return max(0.0, 1.0 - (candidate_units / reference_units))
 
 
 if __name__ == "__main__":
