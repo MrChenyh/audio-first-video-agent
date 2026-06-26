@@ -75,6 +75,15 @@ LangGraph 节点：
 
 默认配置已经启用自适应短 clip：静态检查自动用 2 秒，时间过程类检查用 `JOYAI_CLIP_SECONDS`。
 
+更完整的方法对比见：[AI 看视频方法对比](docs/method_comparison.md)。这份文档把当前常见路线拆成均匀抽帧、场景切分、高密度抽帧、整段视频直塞、ASR-only、视频 RAG、流式模型和本项目的音频优先短 clip，并从 Temporal Recall、Evidence Hit Score、视觉预算、延迟、载荷、可回溯性等指标对比。
+
+本轮最关键的采样效率数据：
+
+- 两条视频总时长 1815 秒，8 个关键 probe 点。
+- 均匀 12 帧/视频在 +/-4 秒内只命中 1/8 个关键点，Temporal Recall 为 12.5%。
+- 若均匀采样要保证 +/-4 秒覆盖，约需 228 帧；保证 +/-2 秒覆盖，约需 455 帧。
+- 本项目的 4 秒短 clip 只看 32 秒，占总时长 1.76%，但 8 个 probe 点全部命中，平均命中分 1.000。
+
 ## 技术栈
 
 - 后端：Python、FastAPI、LangGraph、SQLite。
@@ -304,6 +313,12 @@ LIVE_FRAME_WIDTH=640
 
 ```powershell
 python scripts\benchmark_multidim.py
+```
+
+从 benchmark 报告生成方法级对比摘要：
+
+```powershell
+python scripts\compare_methods_from_benchmark.py data\benchmarks\20260626_162946\report.json
 ```
 
 只做冒烟：
