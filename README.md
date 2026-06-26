@@ -1,43 +1,87 @@
-# Audio-First Video Understanding Agent
+﻿# Audio-First Video Understanding Agent
 
-一个本地优先的视频理解工作台：上传视频或输入视频 URL 并提问后，系统会先理解音频，构建“盲人视角”的事件假设，再用少量目标关键帧验证这些假设，最后生成带时间戳证据的视频问答总结。完成后也可以继续多轮追问。
+一个本地优先的视频/直播理解工作台。它不是把视频均匀切成一堆帧再逐帧看，而是先理解音频，构建“盲人视角”的事件时间线，再用少量音频引导的短视频 clip 验证关键画面，最后把视频内容变成可追问的问答知识库。
 
-这个项目的重点不是“均匀抽帧再逐帧看”，而是一个有目的的 agent loop：
+当前主方案是：**音频转写 + 世界模型 + 目标短 clip + 多轮问答**。实测下来，直接把整段长视频丢给多模态模型虽然很快，但长视频细节和时间线不稳定；短 clip 更适合作为可靠的视频记忆单元。
+
+## 主要能力
+
+- 上传本地视频，或输入视频页面/直链 URL 后自动解析。
+- 支持常见页面 URL：抖音、B 站、YouTube 等通过 `yt-dlp` 下载后分析；直链 `mp4/webm/mov/m3u8/flv` 直接处理。
+- 音频优先分析：抽取音频、转写、生成事件时间线和可验证视觉假设。
+- JoyAI 短 clip 视觉理解：默认抽 2-4 秒局部视频片段给 JoyAI `video_url`，比单帧更能看出动作、切换、样片和上下文。
+- 多轮追问：视频解析完成后，用户可以继续问总结、时间点、产品对比、购买建议、具体画面等问题。
+- 联网增强：追问时可选择联网搜索，把视频知识库和外部资料结合回答。
+- 直播合规监控：直播 URL 可进入独立监控链路，只在发现违禁词、粗口、擦边、抽烟等风险时保留证据。
+- 本地优先存储：源视频、音频、关键帧、状态、SQLite 都写入本地 `data/`，默认不提交到 Git。
+- 可复现实测：内置 benchmark 脚本，可对比单帧、短 clip、整段粗扫的速度和准确性。
+
+## 架构
 
 ```mermaid
-flowchart LR
-  A["上传视频 + 问题"] --> B["抽取音频"]
-  B --> C["音频转写"]
-  C --> D["构建音频先验世界模型"]
-  D --> E["生成目标帧验证问题"]
-  E --> F["少量抽帧"]
-  F --> G["视觉验证"]
-  G --> H["预测下一段可见证据"]
-  H --> I{"匹配吗？"}
-  I -- "匹配" --> J["最终回答"]
-  I -- "需要更多证据" --> E
+flowchart TD
+  A["上传视频 / 视频URL"] --> B["FFmpeg 读取元数据"]
+  B --> C["抽取 16k mono WAV"]
+  C --> D["音频转写 API / faster-whisper"]
+  D --> E["音频先验世界模型"]
+  E --> F["候选时间点生成"]
+  F --> G["关键帧计划"]
+  G --> H["抽关键帧 + 短 clip"]
+  H --> I["JoyAI / 视觉模型观察"]
+  I --> J["预测与验证"]
+  J --> K["最终总结 + 可追问知识库"]
+  K --> L["用户继续问答 / 联网增强"]
 ```
 
-## 核心能力
+LangGraph 节点：
 
-- 音频优先：优先用音频转写形成时间线、人物、环境、情绪和视觉假设。
-- 目标帧验证：每一帧都带有一个明确的验证目标，例如“是否出现红盖头/婚礼动作”。
-- 局部回看：预测失败或证据不确定时，只在相关时间窗二分式补帧。
-- LangGraph 工作流：用 `StateGraph` 串起 ingest、audio、vision、prediction、verification、synthesis。
-- 本地优先存储：视频、音频、帧、状态和 SQLite 都保存在本地 `data/`，默认不上传到仓库。
-- 可降级转写：API 转写不可用时，可使用本地 faster-whisper 模型。
-- Web 工作台：React/Vite 前端展示进度、音频时间线、关键帧证据、覆盖情况、最终答案和多轮追问。
-- 直播分析：直播 URL 或 m3u8/flv 直链会进入独立 Live Session，按短窗口实时切片、转写、抽关键帧并推送分段总结。
-- URL 输入：直链 mp4/webm/mov 可直接下载；站点页面链接可通过 `yt-dlp` 下载后进入同一条分析链路。
+1. `ingest_video`：读取时长、fps、分辨率、音频轨。
+2. `extract_audio`：抽取 16kHz mono WAV。
+3. `transcribe_audio`：API 转写，失败时可走本地 faster-whisper。
+4. `build_audio_world_model`：根据音频构建时间线、人物、场景、情绪和待验证视觉证据。
+5. `generate_frame_candidates`：用低成本分析帧生成候选点。
+6. `plan_keyframes`：结合用户问题和音频事件选择少量关键时间点。
+7. `extract_keyframes`：抽关键帧。
+8. `observe_frames`：默认对静态视频抽短 clip 给 JoyAI；直播合规仍走单帧审核。
+9. `predict_next_events`：生成可验证的短假设。
+10. `verify_predictions`：判断 match / conflict / uncertain，必要时局部补采样。
+11. `synthesize_answer`：生成最终回答和后续问答知识库。
+
+## 为什么使用短 clip
+
+我们实测了两条视频：
+
+- 17 分钟 3D 打印装修长视频。
+- 约 12 分钟 Pocket 4P 评测视频。
+
+测试 8 个音频引导关键时间点，比较单帧、2 秒 clip、4 秒 clip、8 秒 clip、低分辨率 clip、带音频 clip、整段粗扫。
+
+| 方案 | 平均耗时 | 平均命中分 | 通过率 | 结论 |
+|---|---:|---:|---:|---|
+| 单帧 640 | 1.415s | 0.833 | 62.5% | 快，但容易漏掉过程和上下文 |
+| 2 秒 clip 640 | 2.152s | 1.000 | 100% | 很稳，成本低 |
+| 4 秒 clip 640 | 2.164s | 1.000 | 100% | 当前默认主方案 |
+| 8 秒 clip 640 | 2.135s | 0.875 | 75% | 上下文太多，偶尔跑偏 |
+| 4 秒 clip 320 | 1.593s | 0.917 | 75% | 更快，但文字/细节下降 |
+| 4 秒 clip 640 + 音频 | 1.405s | 0.833 | 75% | 不比“外部音频转写 + prompt”稳定 |
+| 整段 320p/1fps 粗扫 | 编码 3.145s + 模型 2.195s | 0.666 | - | 能看主题，不适合做主记忆 |
+
+结论：
+
+- 静态证据点用 2 秒 clip 足够快。
+- 动作、样片、动态范围、长焦切换、稳定性等问题用 4 秒 clip 更稳。
+- 8 秒 clip 不适合默认，因为容易引入无关上下文。
+- 整段直塞模型只能作为粗扫，不适合作为视频问答知识库。
+
+默认配置已经启用自适应短 clip：静态检查自动用 2 秒，时间过程类检查用 `JOYAI_CLIP_SECONDS`。
 
 ## 技术栈
 
-- 后端：Python、FastAPI、LangGraph、SQLite
-- 前端：React、Vite、TypeScript、Lucide Icons
-- 多媒体处理：FFmpeg / ffprobe
-- 模型接口：OpenAI-compatible API
-- 本地音频兜底：faster-whisper
-- URL 下载：httpx / yt-dlp
+- 后端：Python、FastAPI、LangGraph、SQLite。
+- 前端：React、Vite、TypeScript、Lucide Icons。
+- 多媒体：FFmpeg / ffprobe、yt-dlp。
+- 模型：OpenAI-compatible API、JoyAI-VL-Interaction、本地 faster-whisper fallback。
+- 存储：本地文件系统 + SQLite + `state.json` checkpoint。
 
 ## 目录结构
 
@@ -45,11 +89,14 @@ flowchart LR
 audio_first_video_agent/
   backend/
     app/
-      ai.py             # 模型调用、转写、视觉观察、总结
+      ai.py             # 模型调用、转写、视觉观察、追问回答
       workflow.py       # LangGraph 工作流
-      keyframes.py      # 音频引导的目标抽帧策略
-      prediction.py     # 预测验证分类
+      keyframes.py      # 音频引导抽帧策略
+      candidates.py     # 低成本候选帧扫描
+      live.py           # 直播合规监控
+      main.py           # FastAPI 路由
       video.py          # FFmpeg / ffprobe 封装
+      web_search.py     # 联网搜索增强
       storage.py        # SQLite 和 state.json 存储
     tests/
   frontend/
@@ -57,13 +104,14 @@ audio_first_video_agent/
       App.tsx
       styles.css
   scripts/
+    benchmark_multidim.py
     start_backend.ps1
     start_frontend.ps1
   .env.example
   README.md
 ```
 
-运行时数据会写入：
+运行时数据：
 
 ```text
 data/uploads/{job_id}/source.mp4
@@ -73,13 +121,13 @@ data/jobs/{job_id}/state.json
 data/app.db
 ```
 
-`data/`、`.env`、模型权重、上传视频和 SQLite 数据库已被 `.gitignore` 排除。
+`data/`、`.env`、上传视频、SQLite、模型权重都已被 `.gitignore` 排除。
 
 ## 快速开始
 
 ### 1. 安装依赖
 
-准备：
+需要：
 
 - Python 3.11+
 - Node.js 20+
@@ -103,44 +151,68 @@ cd frontend
 pnpm install
 ```
 
-### 2. 配置模型
+### 2. 配置 `.env`
 
-编辑根目录 `.env`：
+最小 OpenAI-compatible 配置：
 
 ```env
 OPENAI_API_KEY=你的_API_KEY
 OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
 AUDIO_FIRST_MOCK_MODE=false
-AUDIO_FIRST_FAST_MODE=false
+AUDIO_FIRST_FAST_MODE=true
 
-VISION_MODEL=gpt-5.4
+TRANSCRIBE_MODEL=gpt-4o-transcribe
+TRANSCRIBE_FALLBACK_MODEL=gpt-4o-transcribe
 REASONING_MODEL=gpt-5.4
 REASONING_EFFORT=low
+FOLLOWUP_MODEL=gpt-5.4
 
-# 可选：把本地 JoyAI-VL-Interaction 用作高速视觉验证器。
-# openai = 使用 VISION_MODEL；joyai = 使用本地 JoyAI adapter；auto = 先试 JoyAI，失败再回退到 VISION_MODEL。
 VISION_PROVIDER=openai
+VISION_MODEL=gpt-5.4
+```
+
+使用本地 JoyAI 做短 clip 视觉理解：
+
+```env
+VISION_PROVIDER=joyai
 JOYAI_API_BASE=http://127.0.0.1:8070/v1
 JOYAI_API_KEY=EMPTY
 JOYAI_MODEL=JoyAI-VL-Interaction-Preview
 JOYAI_TIMEOUT_SECONDS=30
-
-LOCAL_TRANSCRIBE_FALLBACK=true
-LOCAL_TRANSCRIBE_MODEL=data/models/faster-whisper-base
-MAX_KEYFRAMES=6
-LLM_TIMEOUT_SECONDS=90
-LLM_MAX_RETRIES=1
+JOYAI_INPUT_MODE=clips
+JOYAI_CLIP_SECONDS=4
+JOYAI_ADAPTIVE_CLIP_SECONDS=true
+JOYAI_CLIP_WIDTH=640
+JOYAI_MAX_CLIPS_PER_JOB=4
 ```
 
-如果没有可用 API，可以把 `AUDIO_FIRST_MOCK_MODE=true` 用于验证流程和界面。
+本地转写兜底：
 
-如果要启用 JoyAI 组合模式，先启动 JoyAI 的 vLLM 主服务和 `live_adapter.py`，确认 `http://127.0.0.1:8070/health` 返回 200，然后把 `VISION_PROVIDER=joyai`。此时 agent 仍然用音频转写和世界模型决定“该看哪里”，但目标帧视觉验证会交给本地 JoyAI，适合低延迟检查红布、囍字、人物动作、场景变化等可见证据。
+```env
+LOCAL_TRANSCRIBE_FALLBACK=true
+LOCAL_TRANSCRIBE_FIRST=false
+LOCAL_TRANSCRIBE_MODEL=data/models/faster-whisper-base
+```
 
-如果要优先速度，可以再设置 `AUDIO_FIRST_FAST_MODE=true`。快速模式会跳过耗时的大模型预测、验证和最终总结调用，改用本地启发式生成音频时间线、覆盖检查和中文答案；适合短视频快速质检，但细节推理会比完整模式粗一些。长视频下建议同时设置 `FAST_MAX_KEYFRAMES=12`、`FAST_SECONDS_PER_FRAME=120`，让 17 分钟级视频自动扩展到约 9 个关键画面，而不是固定只看 4 帧。
+长视频建议：
 
-### 3. 启动服务
+```env
+MIN_VIDEO_SECONDS=0
+MAX_VIDEO_SECONDS=0
+FAST_MAX_KEYFRAMES=12
+FAST_SECONDS_PER_FRAME=120
+FAST_MAX_TIMELINE_EVENTS=12
+```
 
-方式一：脚本启动。
+没有 API 时，可设置：
+
+```env
+AUDIO_FIRST_MOCK_MODE=true
+```
+
+### 3. 启动
+
+脚本启动：
 
 ```powershell
 # terminal 1
@@ -150,50 +222,71 @@ LLM_MAX_RETRIES=1
 .\scripts\start_frontend.ps1
 ```
 
-方式二：手动启动。
+手动启动：
 
 ```powershell
-# backend
 $env:PYTHONPATH="backend"
-python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --reload
 
-# frontend
 cd frontend
-pnpm dev
+pnpm dev --host 127.0.0.1
 ```
 
-打开：
+打开：[http://127.0.0.1:5173/](http://127.0.0.1:5173/)
 
-[http://127.0.0.1:5173/](http://127.0.0.1:5173/)
+## 页面交互
+
+前端是一个单页工作台：
+
+- 上半部分：视频/直播播放区域。
+- 下半部分：上传本地视频、输入直播/视频 URL、问答对话。
+- 上传视频后，后台立即解析，agent 会提示用户可以开始提问。
+- 用户追问时，默认只用视频知识库；打开联网后，会把外部搜索结果作为补充。
+- 回答里的视频时间点用于跳转播放。
 
 ## API
 
-- `POST /api/jobs`：上传视频和问题，返回 `job_id`
-- `POST /api/jobs/url`：传入 `{url, question}`，下载视频后创建同样的分析任务
-- `GET /api/jobs/{job_id}`：查询状态、进度、当前节点和错误
-- `GET /api/jobs/{job_id}/events`：SSE 进度流
-- `GET /api/jobs/{job_id}/partial`：查询已完成的音频、关键画面和观察结果，用于前端实时展示
-- `GET /api/jobs/{job_id}/result`：查询最终答案、时间线、关键帧和覆盖情况
-- `POST /api/jobs/{job_id}/ask`：基于已保存 state/result 继续追问
-- `GET /api/jobs/{job_id}/frames/{filename}`：读取抽取的帧图片
-- `GET /api/jobs/{job_id}/source`：读取上传或下载后的源视频，用于前端预览
-- `POST /api/live/sessions`：创建直播分析 session，支持 `{url, question, window_seconds, max_segments}`
-- `GET /api/live/sessions/{session_id}`：查询直播 session 当前状态和分段结果
-- `GET /api/live/sessions/{session_id}/events`：SSE 实时推送直播分段总结
-- `POST /api/live/sessions/{session_id}/stop`：停止直播分析
-- `GET /api/live/{session_id}/frames/{filename}`：读取直播短窗口关键帧
+- `POST /api/jobs`：上传视频，返回 `job_id`。
+- `POST /api/jobs/url`：传入 `{url, question}`，下载后进入同一条分析链路。
+- `GET /api/jobs/{job_id}`：查询状态、进度、当前节点和错误。
+- `GET /api/jobs/{job_id}/events`：SSE 任务进度。
+- `GET /api/jobs/{job_id}/partial`：查询已完成的部分结果。
+- `GET /api/jobs/{job_id}/result`：查询最终结果。
+- `POST /api/jobs/{job_id}/ask`：基于已解析视频继续追问，支持 `use_web_search`。
+- `GET /api/jobs/{job_id}/frames/{filename}`：读取关键帧。
+- `GET /api/jobs/{job_id}/source`：读取源视频。
+- `POST /api/live/sessions`：创建直播合规监控。
+- `GET /api/live/sessions/{session_id}`：查询直播监控状态。
+- `GET /api/live/sessions/{session_id}/events`：SSE 直播监控事件。
+- `POST /api/live/sessions/{session_id}/stop`：停止直播监控。
+- `GET /api/live/{session_id}/frames/{filename}`：读取风险证据帧。
 
-## 直播分析
+## URL 下载
 
-直播分析和上传视频分析是两条独立链路。上传视频会跑完整 LangGraph job；直播分析更像一个持续运行的采样器：
+直链视频会直接下载。页面链接依赖 `yt-dlp`，例如抖音、B 站、YouTube。
 
-1. 解析直播 URL。直链 `m3u8/flv/mp4` 直接使用；抖音直播页面会尝试从 HTML 中提取 `hls_pull_url` / `flv_pull_url`。
-2. FFmpeg 每 `LIVE_WINDOW_SECONDS` 秒捕获一个短视频窗口。
-3. 每个窗口抽音频、转写、抽中点关键帧。
-4. 用 JoyAI 或当前视觉模型观察该关键帧。
-5. 通过 SSE 把该段的音频、画面证据和一句实时总结推到前端。
+部分抖音页面需要新鲜 cookie：
 
-配置项：
+```env
+DOUYIN_COOKIES_FILE=C:\path\to\cookies.txt
+YTDLP_COOKIES_FILE=C:\path\to\cookies.txt
+YTDLP_COOKIES_FROM_BROWSER=edge
+```
+
+如果 `yt-dlp` 报 `Unsupported URL`，通常是该站点 URL 形态未被当前 `yt-dlp` 支持，或需要 cookie/登录态。可以先把网页中的真实 `mp4/m3u8/flv` 链接粘进去。
+
+## 直播合规监控
+
+直播分析和静态视频问答是两条独立链路。直播监控不是持续保存所有画面，而是：
+
+1. 解析直播 URL 或直链。
+2. FFmpeg 每 `LIVE_WINDOW_SECONDS` 秒捕获短窗口。
+3. 抽音频转写，检查粗口/违禁词。
+4. 抽中点帧，检查擦边、抽烟、裸露、暴力、危险行为等可见风险。
+5. 正常窗口只计数并删除临时文件；只有命中风险时保留证据。
+6. SSE 推送风险和扫描统计。
+
+配置：
 
 ```env
 LIVE_WINDOW_SECONDS=2
@@ -203,102 +296,63 @@ LIVE_FAST_CAPTURE=true
 LIVE_FRAME_WIDTH=640
 ```
 
-`LIVE_FAST_CAPTURE=true` 会跳过“先录 mp4 再拆音频/抽帧”的兼容路径，改为 FFmpeg 直接从直播流并行抓 16k WAV 和中点 JPEG，减少一次落盘、一次 probe 和两次二次处理。`LIVE_FRAME_WIDTH=640` 会把直播关键帧缩到适合低延迟视觉理解的宽度。`LIVE_MAX_SEGMENTS=0` 表示持续分析；调试时可以在前端填 `1` 或 `3`，先快速验证直播流是否可解析。
+实测低延迟捕获下，2 秒窗口热启动可以压到约 1.5 秒级，主要耗时来自本地转写和 JoyAI 视觉审核。
 
-实测 `https://live.douyin.com/547977714661`：旧版兼容路径 3 秒窗口端到端约 8.8 秒；低延迟捕获 + 缓存 faster-whisper/JoyAI client 后，2 秒窗口第一段冷启动约 7.08 秒，第二段热启动约 1.56 秒，其中转写约 0.72 秒、视觉约 0.64 秒。这才更接近 JoyAI/流式监控模型宣传的“压秒级”使用方式。若某个直播间需要登录态或 cookie，可粘贴已经获取到的 m3u8/flv 直链。
+## Benchmark
 
-## Agent 工作流
-
-1. `ingest_video`：读取视频时长、fps、分辨率和音频轨。
-2. `extract_audio`：抽取 16kHz mono WAV。
-3. `transcribe_audio`：优先 API 转写，失败时使用本地 faster-whisper。
-4. `build_audio_world_model`：只根据音频构建事件时间线和可验证视觉假设。
-5. `generate_frame_candidates`：在音频事件窗口内抽取低分辨率分析帧，用亮度变化、average hash、边缘密度和事件类型生成低成本候选帧。
-6. `plan_keyframes`：把音频事件变成目标帧验证问题，融合候选帧，并在预算内选择少量帧。
-7. `extract_keyframes`：用 FFmpeg 抽帧，避开视频末尾不可抽取边界。
-8. `observe_frames`：批量多图回答“这一帧是否验证音频假设”。
-9. `predict_next_events`：预测后续可验证的视觉证据。
-10. `verify_predictions`：内部判定 match / conflict / uncertain，并转化为用户可读的覆盖情况。
-11. 若需要更多证据，回到 `plan_keyframes` 对相关窗口做二分式补帧。
-12. `synthesize_answer`：生成最终中文总结，附证据和未确认点。
-
-## 迭代实验
-
-本仓库包含一个可复现实验脚本，用同一视频对比旧策略和增强策略：
+运行多维度实测：
 
 ```powershell
-$env:PYTHONPATH="backend"
-python scripts\benchmark_agent.py --video "C:\path\to\sample.mp4" --output data\benchmarks\latest.json
+python scripts\benchmark_multidim.py
 ```
 
-当前增强策略包括：
+只做冒烟：
 
-- 音频窗口内的低成本候选帧扫描，先用本地视觉特征筛出可能有证据的帧。
-- 事件类型感知打分，例如婚礼/结尾更偏向音频事件后段，身份确认更偏向中后段。
-- 初始 enhanced 预算默认压到 `ENHANCED_INITIAL_KEYFRAMES=4`，把剩余预算留给预测误差回看。
-- 回看默认 `REFINEMENT_SAMPLES_PER_WINDOW=1`，每个需要更多证据的窗口只取一个二分中点。
-- `VISION_BATCH_SIZE=3`，一次视觉请求观察多张图，减少模型调度和网络往返。
+```powershell
+python scripts\benchmark_multidim.py --limit-points 1 --skip-whole
+```
 
-在当前样例视频上，最终一次实测结果如下。这里的准确率是针对已知关键事实的代理质量分，不是论文级数据集指标。
+输出目录：
 
-| 策略 | 耗时 | 观察帧 | 视觉请求 | 代理质量分 | 关键结果 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| legacy | 142.94s | 8 | 3 | 5/5 | 识别出救狐相认、婚礼、山林结尾证据不足 |
-| enhanced | 151.06s | 7 | 3 | 5/5 | 少看 1 帧，保留同等关键事实和不确定性判断 |
+```text
+data/benchmarks/{run_id}/report.json
+data/benchmarks/{run_id}/report.md
+```
 
-接入 JoyAI 本地视觉验证器后，同一视频、同样 enhanced 抽帧策略的实测对比如下：
+当前实测结论：
 
-| 视觉验证器 | 耗时 | 观察帧 | 视觉请求 | 代理质量分 | 关键结果 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| OpenAI-compatible `VISION_MODEL=gpt-5.4` | 131.56s | 4 | 2 | 5/5 | 识别出白狐相认、成婚、幸福生活旁白证据偏弱 |
-| JoyAI local adapter | 69.47s | 4 | 4 | 5/5 | 保持同等关键事实，完整流程约快 47%，约 1.9x |
-| JoyAI local adapter + `AUDIO_FIRST_FAST_MODE=true` | 10.27s | 4 | 4 | 5/5 | 跳过大模型预测/验证/总结，保留音频定位和 JoyAI 目标帧证据，答案更模板化 |
-
-这里 JoyAI 的请求数更高，是因为当前实现逐帧调用本地 adapter；但本地单帧延迟低，整体仍明显更快。这个组合验证了当前方向：音频和问题负责缩小注意力范围，JoyAI 负责快速确认目标帧证据。
-
-快速模式的节点级 profile 显示，10 秒样例视频的主要耗时已经变为本地转写、候选帧扫描和 JoyAI 观察帧：`transcribe_audio` 约 3.5s，`generate_frame_candidates` 约 2.8s，`observe_frames` 约 2.9s，其余推理节点基本为 0s。
-
-17 分 33 秒的 Bilibili 长视频样例也已跑通：`AUDIO_FIRST_FAST_MODE=true` + JoyAI local adapter 完整耗时约 90s，旧配置只抽取 4 个目标帧。现在快速模式支持按时长自适应关键帧预算，默认 `FAST_SECONDS_PER_FRAME=120`、`FAST_MAX_KEYFRAMES=12`，这类 17 分钟视频会规划约 9 个关键画面。节点 profile 显示旧配置下 `transcribe_audio` 本地 faster-whisper 占约 77s，候选帧扫描约 6s，JoyAI 观察约 3.8s；因此长视频的主要瓶颈已经转为全量音频转写。
-
-中间实验里，enhanced 虽已使用批量视觉请求，但仍因三点回看多观察 4 帧而慢 79%；加入二分式回看后，额外耗时降到 5.68%，同时少观察 1 帧。下一步主要优化空间是缓存候选帧特征、减少候选扫描 FFmpeg 启动次数，以及让验证器在结尾短窗口上更早停止回看。
+- `clip2_640`：平均 2.152s，命中分 1.000。
+- `clip4_640`：平均 2.164s，命中分 1.000。
+- `frame_640`：平均 1.415s，命中分 0.833。
+- `whole_320p_1fps`：很快但容易丢细节或跑偏，不作为主记忆。
 
 ## 测试
 
-后端单元测试：
+后端：
 
 ```powershell
 $env:PYTHONPATH="backend"
 python -m pytest backend\tests -q
 ```
 
-前端构建：
+前端：
 
 ```powershell
-cd frontend
-pnpm build
+pnpm --dir frontend build
 ```
-
-当前覆盖重点：
-
-- 音频引导抽帧和去重。
-- 预算帧数下保留关键后段证据。
-- 不抽视频精确末尾帧。
-- enhanced 候选帧分类、候选 probe 和二分式 refinement。
-- 预测验证的 match / conflict / uncertain。
-- LangGraph mock 流程完整跑通。
-- 不确定预测触发局部 refinement。
 
 ## 已知限制
 
-- v1 是产品原型，不做论文级 benchmark。
-- 当前主要处理本地上传视频，不包含用户权限、云存储和队列系统。
-- 视频视觉理解仍依赖图像模型调用；当前已支持批量多图观察，但慢速模型仍会影响观察阶段。
-- 直接视频多模态模型可以作为旁路全局视觉扫描，但当前主线仍是“音频先验 + 目标帧验证”。
-- 若代理 API 不支持音频接口，转写会使用本地 faster-whisper fallback。
+- 这是产品原型，不是论文级 benchmark。
+- 音频转写质量会直接影响时间线和抽 clip 的质量。
+- JoyAI 整段长视频输入目前只适合粗扫主题，不适合做可靠细节记忆。
+- 页面 URL 解析受 `yt-dlp`、cookie 和目标站反爬策略影响。
+- 直播合规监控是规则 + 多模态判断，不等同于平台级审核系统。
+- 联网搜索只作为外部资料补充，视频中的观点和证据仍然优先。
 
 ## GitHub 发布注意
 
-发布前确认不要提交：
+不要提交：
 
 - `.env`
 - `data/`
@@ -307,4 +361,4 @@ pnpm build
 - 本地视频、音频、关键帧、SQLite 数据库
 - 本地 faster-whisper 模型权重
 
-这些路径已经在 `.gitignore` 中排除。
+这些路径已在 `.gitignore` 中排除。

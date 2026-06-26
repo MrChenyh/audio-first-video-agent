@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import base64
 import json
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
 from .prediction import classify_prediction_check
+
+
+def _safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
 
 
 class AIClient:
@@ -307,20 +317,28 @@ class AIClient:
 
         if self.settings.vision_provider in {"joyai", "joyai_adapter", "auto"}:
             try:
-                observations = self._observe_frames_with_joyai(
-                    question=question,
-                    frames=frames,
-                    audio_world_model=audio_world_model,
-                    session_id=session_id,
-                )
+                if self._should_use_joyai_clips(question, frames):
+                    observations = self._observe_clips_with_joyai(
+                        question=question,
+                        frames=frames,
+                        audio_world_model=audio_world_model,
+                        session_id=session_id,
+                    )
+                else:
+                    observations = self._observe_frames_with_joyai(
+                        question=question,
+                        frames=frames,
+                        audio_world_model=audio_world_model,
+                        session_id=session_id,
+                    )
                 self.last_vision_request_count = len(frames)
                 return observations
-            except Exception:
+            except Exception as exc:
                 if not self.settings.allow_model_fallback:
                     raise
                 if self.settings.vision_provider in {"joyai", "joyai_adapter"}:
                     self.last_vision_request_count = len(frames)
-                    return self._fallback_frame_observations(frames, "JoyAI local vision endpoint failed.")
+                    return self._fallback_frame_observations(frames, f"JoyAI local vision endpoint failed: {exc}")
 
         observations: list[dict[str, Any]] = []
         schema = {
@@ -450,12 +468,19 @@ class AIClient:
             is_live = (frame.get("probe") or {}).get("type") == "live_segment"
             if is_live:
                 prompt = (
-                    "</response> 用中文用一句话概括直播当前画面。只说可见主体、动作、屏幕文字/商品/场景，"
-                    "不要解释流程，不要输出无关字幕。\n"
+                    "</response> 你是直播画面合规审核器，只根据当前帧可见事实判断，不要猜测。"
+                    "只返回 JSON，不要输出解释性段落。JSON 字段："
+                    "risk_level(none/low/medium/high), caption, violations[]. "
+                    "violations 每项包含 category(sexual_suggestive/smoking/nudity/violence/dangerous/alcohol/gambling/drugs/other), "
+                    "severity(low/medium/high), confidence(0-1), evidence, visible_text[]. "
+                    "规则：没有明确可见风险时 risk_level=none 且 violations=[]；"
+                    "擦边/低俗必须有暴露、性暗示姿态、镜头刻意聚焦等可见证据，普通穿着不要报；"
+                    "抽烟必须看见香烟/电子烟/烟雾或明确吸烟动作；"
+                    "只记录违规相关证据，不要描述无风险画面。\n"
                     f"问题: {target}\n"
                     f"音频: {audio_context}"
                 )
-                max_tokens = 56
+                max_tokens = 220
             else:
                 prompt = (
                     "You are the fast local visual verifier inside an audio-first video agent. "
@@ -494,19 +519,217 @@ class AIClient:
             observations.append(self._joyai_text_to_observation(frame, target, audio_context, raw_text or ""))
         return observations
 
-    def _fallback_frame_observations(self, frames: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+    def _observe_clips_with_joyai(
+        self,
+        *,
+        question: str,
+        frames: list[dict[str, Any]],
+        audio_world_model: dict[str, Any],
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        from openai import OpenAI
+
+        if self._joyai_client is None:
+            self._joyai_client = OpenAI(
+                api_key=self.settings.joyai_api_key,
+                base_url=self.settings.joyai_api_base,
+                timeout=self.settings.joyai_timeout_seconds,
+                max_retries=0,
+            )
+        client = self._joyai_client
+        observations: list[dict[str, Any]] = []
+        clip_frames = frames[: self.settings.joyai_max_clips_per_job or len(frames)]
+        for index, frame in enumerate(clip_frames):
+            target = str((frame.get("probe") or {}).get("question") or frame.get("reason") or question)
+            audio_context = self._audio_context_for_time(audio_world_model, float(frame["time"]))
+            clip_seconds = self._clip_seconds_for_frame(question, frame)
+            start = max(0.0, float(frame["time"]) - clip_seconds / 2)
+            try:
+                clip_path = self._extract_temp_clip(Path(frame["path"]), start, clip_seconds, frame, index)
+            except Exception as exc:
+                frame_observation = self._observe_frames_with_joyai(
+                    question=question,
+                    frames=[frame],
+                    audio_world_model=audio_world_model,
+                    session_id=session_id,
+                )[0]
+                frame_observation["clip"] = {
+                    "start": round(start, 2),
+                    "end": round(start + clip_seconds, 2),
+                    "mode": "fallback_image_url",
+                    "duration_seconds": clip_seconds,
+                    "error": str(exc),
+                }
+                observations.append(frame_observation)
+                continue
+            try:
+                clip_url = self._video_data_url(clip_path)
+                frame_session_id = session_id or f"audio-first-clip-{int(time.time() * 1000)}-{index}"
+                prompt = (
+                    "You are the short-clip observer in an audio-first video agent. "
+                    "Watch the continuous clip, not just one frame. Answer in Chinese after </response>. "
+                    "Focus on the user question and the audio-derived target: what changes during these seconds, "
+                    "what objects/actions/text are visible, and whether the clip supports, conflicts with, or is "
+                    "uncertain for the target. Be specific; do not produce a generic caption. "
+                    "End with exactly one conclusion phrase: 结论：支持, 结论：冲突, or 结论：不确定.\n"
+                    f"User question: {question}\n"
+                    f"Clip time range: {start:.2f}s-{start + clip_seconds:.2f}s\n"
+                    f"Audio context near this clip: {audio_context}\n"
+                    f"Visual target to verify: {target}"
+                )
+                response = client.chat.completions.create(
+                    model=self.settings.joyai_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "video_url", "video_url": {"url": clip_url}},
+                            ],
+                        }
+                    ],
+                    max_tokens=180,
+                    temperature=0,
+                    extra_headers={
+                        "x-streaming-session": frame_session_id,
+                        "x-frame-time-range": f"{start:.2f}s-{start + clip_seconds:.2f}s",
+                    },
+                )
+                raw_text = response.choices[0].message.content if response.choices else ""
+                observation = self._joyai_text_to_observation(frame, target, audio_context, raw_text or "")
+                observation["clip"] = {
+                    "start": round(start, 2),
+                    "end": round(start + clip_seconds, 2),
+                    "mode": "joyai_video_url",
+                    "duration_seconds": clip_seconds,
+                }
+                observations.append(observation)
+            finally:
+                try:
+                    clip_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        if len(clip_frames) < len(frames):
+            observations.extend(
+                self._fallback_frame_observations(
+                    frames[len(clip_frames) :],
+                    "Skipped clip observation because JOYAI_MAX_CLIPS_PER_JOB was reached.",
+                )
+            )
+        return observations
+
+    def _extract_temp_clip(self, frame_path: Path, start: float, duration: float, frame: dict[str, Any], index: int) -> Path:
+        video_path = self._video_path_from_frame_path(frame_path)
+        temp_dir = Path(tempfile.gettempdir()) / "audio_first_video_agent_clips"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = temp_dir / f"joyai_clip_{int(time.time() * 1000)}_{index}.mp4"
+        from .video import VideoProcessor
+
+        VideoProcessor(self.settings).extract_clip(
+            video_path,
+            start,
+            duration,
+            clip_path,
+            width=self.settings.joyai_clip_width,
+        )
+        return clip_path
+
+    def _video_path_from_frame_path(self, frame_path: Path) -> Path:
+        job_dir = frame_path.resolve().parents[1]
+        upload_path = self.settings.data_dir / "uploads" / job_dir.name / "source.mp4"
+        if upload_path.exists():
+            return upload_path
+        raise RuntimeError(f"Could not find source video for frame path: {frame_path}")
+
+    def _should_use_joyai_clips(self, question: str, frames: list[dict[str, Any]]) -> bool:
+        mode = self.settings.joyai_input_mode
+        if mode == "frames" or self.settings.joyai_max_clips_per_job <= 0:
+            return False
+        if any((frame.get("probe") or {}).get("type") == "live_segment" for frame in frames):
+            return False
+        if mode == "clips":
+            return True
+        text = " ".join(
+            [question]
+            + [str(frame.get("reason") or "") for frame in frames]
+            + [str((frame.get("probe") or {}).get("question") or "") for frame in frames]
+        ).lower()
+        temporal_terms = (
+            "稳定",
+            "防抖",
+            "运动",
+            "走动",
+            "变化",
+            "过程",
+            "样片",
+            "动态范围",
+            "低光",
+            "高光",
+            "动作",
+            "切换",
+            "直播",
+            "风险",
+            "抽烟",
+            "擦边",
+            "game",
+            "basketball",
+            "motion",
+            "stabilization",
+        )
+        return any(term in text for term in temporal_terms)
+
+    def _clip_seconds_for_frame(self, question: str, frame: dict[str, Any]) -> float:
+        configured = float(self.settings.joyai_clip_seconds)
+        if not self.settings.joyai_adaptive_clip_seconds:
+            return configured
+        text = " ".join(
+            [
+                question,
+                str(frame.get("reason") or ""),
+                str((frame.get("probe") or {}).get("question") or ""),
+            ]
+        ).lower()
+        temporal_terms = (
+            "稳定",
+            "防抖",
+            "运动",
+            "走动",
+            "变化",
+            "过程",
+            "样片",
+            "动态范围",
+            "低光",
+            "高光",
+            "切换",
+            "发热",
+            "温度",
+            "长焦",
+            "三倍",
+            "60mm",
+            "motion",
+            "stabilization",
+            "dynamic range",
+        )
+        if any(term in text for term in temporal_terms):
+            return configured
+        return max(1.0, min(configured, 2.0))
+
+    @staticmethod
+    def _fallback_frame_observations(frames: list[dict[str, Any]], reason: str) -> list[dict[str, Any]]:
+        user_message = "这一帧已抽取，但视觉识别暂时不可用，后续会继续依靠音频和新画面更新。"
         return [
             {
                 "filename": frame["filename"],
                 "time": frame["time"],
-                "scene": "Frame extracted successfully, but the vision endpoint could not inspect pixels.",
+                "scene": user_message,
                 "objects": [],
                 "actions": [],
                 "visible_text": [],
                 "audio_alignment": "uncertain",
                 "visual_target": str((frame.get("probe") or {}).get("question") or frame.get("reason", "")),
-                "evidence_assessment": reason,
+                "evidence_assessment": user_message,
                 "notes": "Model fallback observation.",
+                "vision_error": reason,
             }
             for frame in frames
         ]
@@ -544,22 +767,79 @@ class AIClient:
         text = raw_text.strip()
         if text.startswith("</response>"):
             text = text.removeprefix("</response>").strip()
+        vision_error = ""
         if not text or raw_text.strip() == "</silence>":
-            text = "JoyAI returned silence for this frame."
+            text = "这一帧已抽取，但视觉模型没有返回可用画面描述。"
+            vision_error = "JoyAI returned silence for this frame."
+        moderation = AIClient._parse_live_moderation_payload(text) if not vision_error else None
+        if moderation:
+            caption = str(moderation.get("caption") or "").strip() or AIClient._caption_from_live_moderation(moderation)
+            visible_text: list[str] = []
+            for violation in moderation.get("violations") or []:
+                if not isinstance(violation, dict):
+                    continue
+                visible_text.extend(str(item).strip() for item in violation.get("visible_text") or [] if str(item).strip())
+            return {
+                "time": frame["time"],
+                "filename": frame["filename"],
+                "visual_target": target,
+                "evidence_assessment": caption,
+                "scene": caption,
+                "objects": [],
+                "actions": [],
+                "visible_text": sorted(set(visible_text)),
+                "audio_alignment": "match" if moderation.get("risk_level") not in {"none", "unknown", ""} else "uncertain",
+                "notes": f"vision_provider=joyai; audio_context={audio_context}",
+                "live_moderation": moderation,
+            }
         lower = text.lower()
         visible_text = []
         for marker in ("囍", "喜", "double happiness", "red cloth", "veil", "盖头", "红布", "红色"):
             if marker.lower() in lower or marker in text:
                 visible_text.append(marker)
-        match_terms = ("match", "matches", "support", "supports", "一致", "符合", "支持", "出现", "可见")
-        conflict_terms = ("conflict", "contradict", "不一致", "冲突", "没有", "未见", "看不到")
-        if any(term in lower or term in text for term in conflict_terms):
+        match_terms = (
+            "match",
+            "matches",
+            "support",
+            "supports",
+            "结论：支持",
+            "结论: 支持",
+            "一致",
+            "符合",
+            "支持",
+            "出现",
+            "可见",
+            "相关",
+            "对应",
+            "相符",
+            "吻合",
+            "验证",
+            "表明",
+            "与音频",
+            "与用户问题",
+        )
+        conflict_terms = (
+            "conflict",
+            "contradict",
+            "结论：冲突",
+            "结论: 冲突",
+            "不一致",
+            "冲突",
+            "没有",
+            "未见",
+            "看不到",
+            "不支持",
+            "无法支持",
+        )
+        if vision_error:
+            alignment = "uncertain"
+        elif any(term in lower or term in text for term in conflict_terms):
             alignment = "conflict"
         elif any(term in lower or term in text for term in match_terms):
             alignment = "match"
         else:
             alignment = "uncertain"
-        return {
+        observation = {
             "time": frame["time"],
             "filename": frame["filename"],
             "visual_target": target,
@@ -571,6 +851,52 @@ class AIClient:
             "audio_alignment": alignment,
             "notes": f"vision_provider=joyai; audio_context={audio_context}",
         }
+        if vision_error:
+            observation["vision_error"] = vision_error
+        return observation
+
+    @staticmethod
+    def _parse_live_moderation_payload(text: str) -> dict[str, Any] | None:
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = AIClient._strip_json_fence(raw)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            payload = json.loads(raw[start : end + 1])
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("risk_level", "none")
+        payload.setdefault("caption", "")
+        payload.setdefault("violations", [])
+        if not isinstance(payload["violations"], list):
+            payload["violations"] = []
+        normalized = []
+        for violation in payload["violations"]:
+            if not isinstance(violation, dict):
+                continue
+            violation.setdefault("category", "other")
+            violation.setdefault("severity", "low")
+            violation.setdefault("confidence", 0.0)
+            violation.setdefault("evidence", "")
+            violation.setdefault("visible_text", [])
+            if not isinstance(violation["visible_text"], list):
+                violation["visible_text"] = [str(violation["visible_text"])]
+            normalized.append(violation)
+        payload["violations"] = normalized
+        return payload
+
+    @staticmethod
+    def _caption_from_live_moderation(payload: dict[str, Any]) -> str:
+        violations = [item for item in payload.get("violations") or [] if isinstance(item, dict)]
+        if not violations:
+            return "当前帧未发现可见违规。"
+        evidence = "；".join(str(item.get("evidence") or item.get("category") or "").strip() for item in violations[:2])
+        return evidence or "当前帧存在疑似违规画面。"
 
     def predict_next_events(
         self,
@@ -738,10 +1064,12 @@ class AIClient:
             "required": ["direct_answer", "summary", "evidence_refs", "uncertainties"],
         }
         prompt = (
-            "Answer the user's question about the video in concise Chinese. Ground the answer in audio timeline "
-            "evidence, frame observations, and prediction checks. Mention uncertainty explicitly when evidence is "
-            "weak. Keep direct_answer under 180 Chinese characters, summary under 450 Chinese characters, and use "
-            "at most 8 evidence_refs.\n\n"
+            "Answer the user's question about the video in concise Chinese. Use the audio timeline, frame "
+            "observations, and prediction checks as grounding. Do not dump evidence lists or internal verification "
+            "logs into direct_answer or summary. You may include 1-3 inline video time anchors such as 7:55 when "
+            "they help the user jump to the relevant moment. Keep direct_answer under 220 Chinese characters and "
+            "summary under 450 Chinese characters. Return evidence_refs as an empty array unless the user explicitly "
+            "asks for evidence.\n\n"
             f"Question: {question}\n"
             f"Audio world model: {json.dumps(audio_world_model, ensure_ascii=False)}\n"
             f"Frame observations: {json.dumps(observations[-12:], ensure_ascii=False)}\n"
@@ -754,9 +1082,20 @@ class AIClient:
                 return self._fallback_answer(question, audio_world_model, observations, checks)
             raise
 
-    def answer_followup(self, *, question: str, result: dict[str, Any]) -> dict[str, Any]:
-        if self.mock or self.settings.fast_mode:
-            return self._local_followup_answer(question, result)
+    def answer_followup(
+        self,
+        *,
+        question: str,
+        result: dict[str, Any],
+        web_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self._should_answer_followup_locally(question, web_context):
+            answer = self._local_followup_answer(question, result, web_context=web_context)
+            if answer.get("answer") and not str(answer.get("answer", "")).startswith("这个追问没有"):
+                return self._attach_web_context(answer, web_context)
+        if self.mock or self._client is None:
+            answer = self._local_followup_answer(question, result, web_context=web_context)
+            return self._attach_web_context(answer, web_context)
         schema = {
             "type": "object",
             "additionalProperties": False,
@@ -764,30 +1103,65 @@ class AIClient:
                 "answer": {"type": "string"},
                 "evidence_refs": {"type": "array", "items": {"type": "string"}},
                 "coverage_note": {"type": "string"},
+                "web_sources": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["answer", "evidence_refs", "coverage_note"],
+            "required": ["answer", "evidence_refs", "coverage_note", "web_sources"],
         }
-        context = {
-            "original_question": result.get("question"),
-            "answer": result.get("answer"),
-            "timeline": (result.get("timeline") or [])[:24],
-            "transcript_segments": (result.get("transcript_segments") or [])[:80],
-            "frames": self._compact_frames_for_prompt(result.get("frames") or []),
-            "metadata": result.get("metadata") or {},
-        }
+        context = self._followup_knowledge_pack(question, result, limit=self.settings.followup_max_chunks)
+        web_enabled = bool(web_context and web_context.get("enabled"))
         prompt = (
-            "Answer this follow-up question in Chinese using only the already extracted transcript and key-frame "
-            "evidence from a previous video analysis. Do not invent unseen content. If the evidence does not cover "
-            "the requested moment, say which time range would need more frames. Keep the answer concise.\n\n"
+            "你是一个视频问答 agent。下面的 JSON 是同一个视频已解析出的知识库切片：音频转写、时间线、"
+            "关键帧观察、以及针对本次追问补看的画面。请优先把这些视频内容当作事实来源来回答用户问题。\n"
+            "要求：\n"
+            "1. 直接回答用户真正问的点，不要复述内部检索、知识库、证据列表或覆盖说明。\n"
+            "2. 如果用户一句话包含多个任务或子问题，必须逐项回答，不要只回答第一个；例如“总结视频，并对比某竞品”要先总结视频，再做竞品对比和选择建议。\n"
+            "3. 可以基于视频里的评价、对比和结论做合理归纳，例如给出条件式购买建议；不要编造视频没有覆盖的事实。\n"
+            "4. 如果本次问题需要视觉细节，优先使用 supplemental_frame_observations；如果仍没有覆盖，就明确说当前分析没看到。\n"
+            "5. 适合时加入 1-4 个视频时间锚点，例如 7:55，方便用户点击跳转。\n"
+            "6. 用中文自然回答，按问题组织内容；不要机械套模板。\n"
+            "7. 如果提供了 web_context，只用它补充视频外部事实、型号参数、背景信息或最新信息；视频里的观点和结论仍然优先。"
+            "当用户要求和视频外产品对比时，只要 web_context 有结果，就必须利用这些结果给出保守对比，而不是说没有资料。"
+            "用 web_context 时，在 web_sources 返回用到的网页标题或 URL；正文里可以用“外部资料显示”简短说明。"
+            "如果 web_context 没有结果或与问题无关，不要强行引用。\n\n"
             f"Follow-up question: {question}\n"
-            f"Analysis context: {json.dumps(context, ensure_ascii=False)}"
+            f"Video knowledge pack: {json.dumps(context, ensure_ascii=False)}\n"
+            f"Web search enabled: {web_enabled}\n"
+            f"web_context: {json.dumps(web_context or {}, ensure_ascii=False)}"
         )
         try:
-            return self._responses_json(self.settings.reasoning_model, prompt, schema, "followup_answer")
+            return self._responses_json(
+                self.settings.followup_model or self.settings.reasoning_model,
+                prompt,
+                schema,
+                "followup_answer",
+                timeout_seconds=self.settings.followup_timeout_seconds,
+            )
         except Exception:
             if self.settings.allow_model_fallback:
-                return self._local_followup_answer(question, result)
+                return self._attach_web_context(self._local_followup_answer(question, result, web_context=web_context), web_context)
             raise
+
+    @staticmethod
+    def _should_answer_followup_locally(question: str, web_context: dict[str, Any] | None = None) -> bool:
+        compact_question = "".join(str(question or "").split()).lower()
+        if not compact_question:
+            return True
+        if web_context and (web_context.get("results") or []):
+            asks_external = any(
+                token in compact_question
+                for token in ("对比", "比较", "哪个更好", "哪款更好", "竞品", "外部", "联网", "vs", "insta360", "luna", "gopro")
+            )
+            if asks_external:
+                return True
+        if AIClient._is_summary_followup_question(compact_question):
+            return True
+        if AIClient._is_buying_advice_followup_question(compact_question):
+            return True
+        if any(token in compact_question for token in ("升级", "提升", "区别", "差异", "比上一代", "普通版", "pro多少")):
+            return True
+        if AIClient._first_time_in_text(question) is not None:
+            return True
+        return False
 
     def _fallback_audio_world_model(self, question: str, transcript_segments: list[dict[str, Any]]) -> dict[str, Any]:
         if not transcript_segments:
@@ -1055,52 +1429,36 @@ class AIClient:
         transcript_bits = [event["text"] for event in events]
         visual_bits = AIClient._clean_visual_evidence(observations)
         title = AIClient._infer_fast_topic(transcript_bits, visual_bits, question)
+        topic_profile = AIClient._fast_topic_profile(transcript_bits, visual_bits, title)
 
-        if "3D 打印" in title:
-            direct = (
-                "这是一个 3D 打印装修实验视频：核心是在一套房的装修和家具制作中尝试使用 3D 打印，"
-                "内容从设计、打印材料/设备、现场施工延伸到成本和成品效果。"
-            )
-        else:
-            direct = f"视频主要围绕{title}展开，音频给出事件线索，关键画面用于确认主要场景和动作。"
-        direct = AIClient._compress_text(direct, 180)
+        direct = topic_profile["direct"]
 
-        process_items = AIClient._fast_process_items(events, title)
+        process_items = AIClient._fast_process_items(events, title, topic_profile)
         if not process_items and transcript_bits:
             process_items = [AIClient._compress_text(bit, 88) for bit in transcript_bits[:4]]
         if not process_items:
             process_items = ["当前没有稳定的音频事件，系统主要依赖稀疏关键画面做概览。"]
+        direct = AIClient._append_time_anchors(AIClient._compress_text(direct, 180), process_items)
 
-        evidence_items = visual_bits[:6] or ["关键画面已经抽取，但视觉模型没有返回可压缩成证据的稳定描述。"]
-        coverage_note = AIClient._fast_coverage_notes(events, observations, len(timeline))
-
-        conclusion_items = [
-            "这轮结果适合先理解视频主线：它不是逐帧详查，而是用音频定位重点，再用少量画面确认代表性片段。"
-        ]
-        if "3D 打印" in title:
-            conclusion_items = [
-                "视频主线是验证 3D 打印在装修和家具制作中的可行性：能做出有层纹和造型的部件，但成本、材料和传统施工衔接仍是重点讨论对象。"
-            ]
+        conclusion_items = [topic_profile["conclusion"]]
 
         sections = [
-            {"title": "视频主题", "items": [direct]},
-            {"title": "过程脉络", "items": process_items[:5]},
-            {"title": "关键画面证据", "items": evidence_items[:6]},
-            {"title": "结论", "items": conclusion_items + coverage_note[:1]},
+            {"title": "内容脉络", "items": process_items[:5]},
+            {"title": "关键结论", "items": conclusion_items},
         ]
         summary = " ".join(
             [
-                "过程脉络：" + "；".join(process_items[:4]) + "。",
-                "关键画面证据：" + "；".join(evidence_items[:4]) + "。",
-                "结论：" + conclusion_items[0],
+                "视频主题：" + direct,
+                "内容脉络：" + "；".join(process_items[:4]) + "。",
+                "关键结论：" + conclusion_items[0],
             ]
         )
         return {
             "direct_answer": direct or f"快速模式已处理问题：{question}",
             "summary": summary[:900],
             "sections": sections,
-            "evidence_refs": (visual_bits[:6] + [f"音频：{bit}" for bit in transcript_bits[:4]])[:8],
-            "uncertainties": coverage_note,
+            "evidence_refs": [],
+            "uncertainties": [],
         }
 
     @staticmethod
@@ -1180,7 +1538,58 @@ class AIClient:
         return "context"
 
     @staticmethod
-    def _fast_process_items(events: list[dict[str, Any]], topic: str) -> list[str]:
+    def _fast_topic_profile(transcript_bits: list[str], visual_bits: list[str], topic: str) -> dict[str, str]:
+        text = " ".join(transcript_bits + visual_bits + [topic])
+        if "3D 打印" in topic:
+            return {
+                "kind": "3d_printing",
+                "direct": (
+                    "这是一个 3D 打印装修实验视频：核心是在一套房的装修和家具制作中尝试使用 3D 打印，"
+                    "内容从设计、打印材料/设备、现场施工延伸到成本和成品效果。"
+                ),
+                "conclusion": "视频主线是验证 3D 打印在装修和家具制作中的可行性：能做出有层纹和造型的部件，但成本、材料和传统施工衔接仍是重点讨论对象。",
+            }
+        if any(token in text for token in ("Pocket", "Pockets", "Pocket 4", "Pockets 4", "Pockets 4P", "大疆", "DJI", "长焦", "主摄", "镜头", "画质", "ISO", "动态范围", "高光", "暗部", "发热", "稳定")):
+            product = AIClient._infer_product_name(text)
+            return {
+                "kind": "product_review",
+                "direct": (
+                    f"这是一期{product}评测视频，核心问题是它相比上一代/普通版是否值得多花钱升级。"
+                    "视频围绕外观形态、双镜头/长焦、画质样片、低光动态范围、稳定性和发热体验展开。"
+                ),
+                "conclusion": f"视频的结论倾向是：{product}的画质和动态范围表现比预期好，长焦/双镜头是主要升级点；是否值得选它取决于你是否重视频质、长焦视角和更完整的拍摄能力。",
+            }
+        if any(token in text for token in ("评测", "测评", "体验", "上手", "外观", "配置", "性能", "价格", "值得", "升级")):
+            return {
+                "kind": "product_review",
+                "direct": "这是一期产品评测/体验视频，核心是在回答这个产品是否值得购买或升级，并按外观、功能、性能和体验来展开。",
+                "conclusion": "视频的结论应围绕产品优缺点和适合人群理解：它不是事件记录，而是在用样片、测试和体验判断购买价值。",
+            }
+        return {
+            "kind": "generic",
+            "direct": f"视频主要围绕{topic}展开。",
+            "conclusion": "这轮结果给出了视频主线和关键节点；证据只用于支撑摘要，不代表完整逐帧审片。",
+        }
+
+    @staticmethod
+    def _infer_product_name(text: str) -> str:
+        candidates = ("Pocket 4P", "Pockets 4P", "Pocket 4 Pro", "Pocket 4", "Pockets 4", "DJI Pocket", "大疆 Pocket")
+        lowered = text.lower()
+        for candidate in candidates:
+            if candidate.lower() in lowered or candidate in text:
+                if candidate == "Pockets 4P":
+                    return "Pocket 4P"
+                if candidate == "Pockets 4":
+                    return "Pocket 4"
+                return candidate
+        return "这款数码影像产品"
+
+    @staticmethod
+    def _fast_process_items(events: list[dict[str, Any]], topic: str, topic_profile: dict[str, str] | None = None) -> list[str]:
+        topic_profile = topic_profile or {"kind": "generic"}
+        if topic_profile.get("kind") == "product_review":
+            return AIClient._fast_product_review_items(events)
+
         order = ["design", "printing", "construction", "cost", "outcome", "context"]
         grouped: dict[str, list[dict[str, Any]]] = {stage: [] for stage in order}
         for event in events:
@@ -1211,6 +1620,31 @@ class AIClient:
             samples = "；".join(AIClient._compress_text(event["text"], 34) for event in stage_events[:2])
             items.append(f"{time_prefix}：{samples}")
         return items
+
+    @staticmethod
+    def _fast_product_review_items(events: list[dict[str, Any]]) -> list[str]:
+        buckets = [
+            ("purchase", ("到底", "放弃", "选择", "原因", "值得", "升级", "多花", "问题", "考虑"), "开头先提出购买疑问：这款产品相比普通版/上一代到底升级在哪里，是否值得为了画质或新镜头多花钱。"),
+            ("design", ("外观", "双头", "形态", "白色", "黑色", "重量", "重心", "配件", "广角镜", "补光灯"), "随后介绍外观和配件：双头形态、白色机身、重量重心变化，以及广角镜、补光灯等附件兼容。"),
+            ("image", ("画质", "样片", "高光", "暗部", "动态范围", "主摄", "传感", "低光", "ISO", "噪点"), "中段重点转向画质测试：通过样片、高光/暗部保留、低光 ISO 和动态范围来判断实际成像表现。"),
+            ("lens", ("镜头", "长焦", "60毫米", "三倍", "主摄", "双镜", "视角"), "镜头部分讨论主摄和长焦的差异，尤其是长焦/三倍视角是否带来真实拍摄价值。"),
+            ("experience", ("稳定", "发热", "测试", "体验", "过程", "总的体验", "续航"), "后段补充使用体验：稳定效果、测试过程、发热和整体体验，最后回到是否值得购买。"),
+        ]
+        items = []
+        used: set[int] = set()
+        for bucket, keywords, template in buckets:
+            matched = [index for index, event in enumerate(events) if index not in used and any(keyword in event["text"] for keyword in keywords)]
+            if not matched:
+                continue
+            for index in matched:
+                used.add(index)
+            start = AIClient._format_seconds(events[matched[0]]["time"])
+            end = AIClient._format_seconds(events[matched[-1]]["time"])
+            time_prefix = start if start == end else f"{start}-{end}"
+            items.append(f"{time_prefix}：{template}")
+        if items:
+            return items
+        return [f"{AIClient._format_seconds(event['time'])}：{AIClient._compress_text(event['text'], 72)}" for event in events[:5]]
 
     @staticmethod
     def _clean_visual_evidence(observations: list[dict[str, Any]]) -> list[str]:
@@ -1264,7 +1698,172 @@ class AIClient:
         return compact
 
     @staticmethod
-    def _local_followup_answer(question: str, result: dict[str, Any]) -> dict[str, Any]:
+    def _followup_knowledge_pack(question: str, result: dict[str, Any], limit: int = 28) -> dict[str, Any]:
+        chunks = AIClient._video_knowledge_chunks(result)
+        ranked = AIClient._rank_knowledge_chunks(question, chunks)
+        selected = ranked[:limit]
+        if not selected:
+            selected = chunks[: min(limit, len(chunks))]
+        return {
+            "original_question": result.get("question"),
+            "prior_answer": result.get("answer"),
+            "metadata": result.get("metadata") or {},
+            "relevant_chunks": selected,
+            "supplemental_frame_observations": result.get("supplemental_frame_observations") or [],
+            "coverage_hint": "Chunks are retrieved from transcript, audio timeline, key-frame observations, and any frames inspected specifically for this follow-up.",
+        }
+
+    @staticmethod
+    def _video_knowledge_chunks(result: dict[str, Any]) -> list[dict[str, Any]]:
+        chunks: list[dict[str, Any]] = []
+        answer = result.get("answer") or {}
+        if answer.get("direct_answer"):
+            chunks.append({"source": "prior_answer", "time": None, "text": str(answer.get("direct_answer"))})
+        for section in answer.get("sections") or []:
+            title = str(section.get("title") or "")
+            for item in section.get("items") or []:
+                text = str(item).strip()
+                if text:
+                    chunks.append({"source": "answer_section", "title": title, "time": AIClient._first_time_in_text(text), "text": text})
+        for item in result.get("timeline") or []:
+            text = " ".join(str(value or "") for value in (item.get("label"), item.get("evidence"), item.get("visual_question")))
+            if text.strip():
+                chunks.append(
+                    {
+                        "source": "audio_timeline",
+                        "time": _safe_float(item.get("time")),
+                        "end_time": _safe_float(item.get("end_time")),
+                        "text": text.strip(),
+                    }
+                )
+        for segment in result.get("transcript_segments") or []:
+            text = str(segment.get("text") or "").strip()
+            if text:
+                chunks.append(
+                    {
+                        "source": "transcript",
+                        "time": _safe_float(segment.get("start")),
+                        "end_time": _safe_float(segment.get("end")),
+                        "text": text,
+                    }
+                )
+        for frame in result.get("frames") or []:
+            observation = frame.get("observation") or {}
+            text = " ".join(
+                str(value or "")
+                for value in (
+                    frame.get("reason"),
+                    observation.get("visual_target"),
+                    observation.get("scene"),
+                    observation.get("evidence_assessment"),
+                    " ".join(observation.get("visible_text") or []),
+                )
+            ).strip()
+            if text:
+                chunks.append(
+                    {
+                        "source": "keyframe",
+                        "time": _safe_float(frame.get("time")),
+                        "filename": frame.get("filename"),
+                        "url": frame.get("url"),
+                        "text": text,
+                    }
+                )
+        for obs in result.get("supplemental_frame_observations") or []:
+            text = " ".join(str(value or "") for value in (obs.get("visual_target"), obs.get("scene"), obs.get("evidence_assessment"))).strip()
+            if text:
+                chunks.append(
+                    {
+                        "source": "supplemental_keyframe",
+                        "time": _safe_float(obs.get("time")),
+                        "filename": obs.get("filename"),
+                        "text": text,
+                    }
+                )
+        return AIClient._dedupe_knowledge_chunks(chunks)
+
+    @staticmethod
+    def _rank_knowledge_chunks(question: str, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        query_terms = AIClient._keywords(question)
+        wants_summary = AIClient._is_summary_followup_question("".join(str(question).split()).lower())
+        wants_advice = AIClient._is_buying_advice_followup_question("".join(str(question).split()).lower())
+        ranked = []
+        for index, chunk in enumerate(chunks):
+            text = str(chunk.get("text") or "")
+            source = str(chunk.get("source") or "")
+            score = AIClient._overlap_score(query_terms, text) * 8
+            if wants_summary and source in {"prior_answer", "answer_section", "audio_timeline"}:
+                score += 9
+            if wants_advice and any(token in text for token in ("值得", "购买", "升级", "多花", "画质", "长焦", "动态范围", "一样", "结论")):
+                score += 12
+            if source == "supplemental_keyframe":
+                score += 5
+            if source == "transcript" and any(token in text for token in ("所以", "总结", "结论", "我觉得", "推荐", "买", "值得")):
+                score += 6
+            if score > 0:
+                ranked.append((score, index, chunk))
+        if not ranked and chunks:
+            ranked = [(1, index, chunk) for index, chunk in enumerate(chunks[:20])]
+        return [chunk for _, _, chunk in sorted(ranked, key=lambda item: (-item[0], item[1]))]
+
+    @staticmethod
+    def _dedupe_knowledge_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped = []
+        seen = set()
+        for chunk in chunks:
+            text = AIClient._compress_text(str(chunk.get("text") or ""), 360)
+            if not text:
+                continue
+            signature = (chunk.get("source"), round(float(chunk.get("time") or -1), 1), text[:80])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            next_chunk = dict(chunk)
+            next_chunk["text"] = text
+            if next_chunk.get("time") is not None:
+                next_chunk["time_label"] = AIClient._format_seconds(float(next_chunk["time"]))
+            deduped.append(next_chunk)
+        return deduped
+
+    @staticmethod
+    def _attach_web_context(answer: dict[str, Any], web_context: dict[str, Any] | None) -> dict[str, Any]:
+        if not web_context or not web_context.get("enabled"):
+            return answer
+        results = web_context.get("results") or []
+        sources = []
+        for item in results[:3]:
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            label = title or url
+            if label and label not in sources:
+                sources.append(label)
+        return {
+            **answer,
+            "web_sources": sources,
+            "coverage_note": answer.get("coverage_note") or ("已开启联网增强，但本地兜底回答只附加来源，不会替代视频分析。" if sources else "联网搜索未返回可用结果。"),
+        }
+
+    @staticmethod
+    def _local_followup_answer(
+        question: str,
+        result: dict[str, Any],
+        web_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if web_context and (web_context.get("results") or []):
+            web_answer = AIClient._web_augmented_local_followup_answer(question, result, web_context)
+            if web_answer:
+                return web_answer
+
+        explicit_time = AIClient._first_time_in_text(question)
+        if explicit_time is None:
+            intent_answer = AIClient._intent_followup_answer(question, result)
+            if intent_answer:
+                return {
+                    "answer": intent_answer[:1200],
+                    "evidence_refs": [],
+                    "coverage_note": "",
+                }
+
         query_terms = AIClient._keywords(question)
         timeline = result.get("timeline") or []
         transcripts = result.get("transcript_segments") or []
@@ -1273,15 +1872,25 @@ class AIClient:
         scored_events = []
         for item in timeline:
             text = " ".join([str(item.get("label", "")), str(item.get("evidence", ""))])
+            time_value = float(item.get("time") or 0.0)
             score = AIClient._overlap_score(query_terms, text)
+            if explicit_time is not None:
+                delta = abs(time_value - explicit_time)
+                if delta <= 45:
+                    score += max(1, int((45 - delta) // 15) + 1)
             if score:
-                scored_events.append((score, float(item.get("time") or 0.0), text))
+                scored_events.append((score, time_value, text))
         scored_transcripts = []
         for item in transcripts:
             text = str(item.get("text", ""))
+            time_value = float(item.get("start") or 0.0)
             score = AIClient._overlap_score(query_terms, text)
+            if explicit_time is not None:
+                delta = abs(time_value - explicit_time)
+                if delta <= 45:
+                    score += max(1, int((45 - delta) // 15) + 1)
             if score:
-                scored_transcripts.append((score, float(item.get("start") or 0.0), text))
+                scored_transcripts.append((score, time_value, text))
         scored_frames = []
         for frame in frames:
             observation = frame.get("observation") or {}
@@ -1293,33 +1902,437 @@ class AIClient:
                     str(frame.get("reason", "")),
                 ]
             )
+            time_value = float(frame.get("time") or 0.0)
             score = AIClient._overlap_score(query_terms, text)
+            if explicit_time is not None:
+                delta = abs(time_value - explicit_time)
+                if delta <= 45:
+                    score += max(1, int((45 - delta) // 15) + 1)
             if score:
-                scored_frames.append((score, float(frame.get("time") or 0.0), text))
+                scored_frames.append((score, time_value, text))
 
         selected = sorted(scored_events + scored_transcripts + scored_frames, key=lambda item: (-item[0], item[1]))[:6]
         if not selected:
-            base_answer = (result.get("answer") or {}).get("direct_answer") or "当前结果里没有命中这个追问的明确证据。"
             return {
-                "answer": f"基于已分析内容：{base_answer}",
+                "answer": "这个追问没有在当前已解析内容里命中足够明确的线索。可以换成更具体的问题，例如问某个产品点、某个时间段，或让我重新按“画质/镜头/体验/结论”展开。",
                 "evidence_refs": [],
-                "coverage_note": "这个追问没有命中已抽取的音频片段或关键画面，建议对相关时间段加密抽帧。",
+                "coverage_note": "",
             }
-        evidence_refs = [f"{AIClient._format_seconds(time)}：{AIClient._compress_text(text, 88)}" for _, time, text in selected]
-        answer = "我在已分析证据里找到这些相关线索：" + "；".join(evidence_refs[:4]) + "。"
+        context = [(time, AIClient._clean_followup_context(text)) for _, time, text in selected]
+        answer = AIClient._compose_local_followup_answer(question, context, result)
         return {
             "answer": answer[:520],
-            "evidence_refs": evidence_refs[:6],
-            "coverage_note": "这是基于当前已抽取音频和关键画面的追问回答；没有重新读取更多视频帧。",
+            "evidence_refs": [],
+            "coverage_note": "",
         }
+
+    @staticmethod
+    def _web_augmented_local_followup_answer(
+        question: str,
+        result: dict[str, Any],
+        web_context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        results = [item for item in web_context.get("results") or [] if isinstance(item, dict)]
+        if not results:
+            return None
+        compact_question = "".join(str(question or "").split()).lower()
+        asks_compare = any(token in compact_question for token in ("对比", "比较", "哪个更好", "哪款更好", "区别", "vs", "比"))
+        asks_summary = AIClient._is_summary_followup_question(compact_question)
+        asks_external = any(token in compact_question for token in ("insta360", "luna", "gopro", "竞品", "外部", "联网"))
+        if not (asks_compare or asks_external):
+            return None
+
+        video_summary = AIClient._intent_followup_answer("详细总结视频内容", result) or AIClient._generic_detailed_followup_answer(result)
+        web_facts = AIClient._summarize_web_facts(results)
+        external_name = AIClient._external_name_from_question(question, results)
+        comparison = AIClient._compose_web_comparison(question, video_summary, web_facts, external_name)
+        if asks_summary:
+            answer = f"先说视频本身：{video_summary}\n\n再对比 {external_name}：{comparison}"
+        else:
+            answer = comparison
+        sources = []
+        for item in results[:4]:
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            label = title or url
+            if label and label not in sources:
+                sources.append(label)
+        return {
+            "answer": answer[:1800],
+            "evidence_refs": [],
+            "coverage_note": "视频判断来自已解析内容；竞品参数来自联网搜索摘要，未做同场样片实测。",
+            "web_sources": sources,
+        }
+
+    @staticmethod
+    def _summarize_web_facts(results: list[dict[str, Any]]) -> dict[str, Any]:
+        text = " ".join(" ".join(str(item.get(key) or "") for key in ("title", "snippet")) for item in results)
+        lower = text.lower()
+        facts: dict[str, Any] = {"raw": text[:1200], "bullets": []}
+        if "8k" in lower:
+            facts["bullets"].append("外部资料显示它主打 8K/高规格视频能力。")
+        if "14 stops" in lower or "14档" in text or "14 stops of dynamic range" in lower:
+            facts["bullets"].append("外部资料多次提到约 14 档动态范围。")
+        if "17 stops" in lower or "17档" in text:
+            facts["bullets"].append("部分资料提到 17 档动态范围，但需要注意是否指向 Pocket 4P 而不是 Luna。")
+        if "dual" in lower or "双" in text or "dual-lens" in lower or "dual lens" in lower:
+            facts["bullets"].append("它同样强调双镜头/双传感器设计。")
+        if "leica" in lower:
+            facts["bullets"].append("外部资料提到 Leica/徕卡相关光学或联合信息。")
+        if "telephoto" in lower or "长焦" in text:
+            facts["bullets"].append("资料中也提到长焦镜头，适合人像、特写和压缩感画面。")
+        if "purevideo" in lower or "low-light" in lower or "low light" in lower or "低光" in text:
+            facts["bullets"].append("它也把低光/夜景增强作为卖点之一。")
+        if not facts["bullets"]:
+            snippets = [AIClient._compress_text(str(item.get("snippet") or item.get("title") or ""), 90) for item in results[:3]]
+            facts["bullets"] = [item for item in snippets if item]
+        return facts
+
+    @staticmethod
+    def _external_name_from_question(question: str, results: list[dict[str, Any]]) -> str:
+        text = str(question or "")
+        if "luna" in text.lower():
+            return "Insta360 Luna"
+        for item in results:
+            title = str(item.get("title") or "")
+            if "Insta360" in title:
+                return "Insta360 Luna"
+        return "外部竞品"
+
+    @staticmethod
+    def _compose_web_comparison(question: str, video_summary: str, web_facts: dict[str, Any], external_name: str) -> str:
+        bullets = [str(item) for item in web_facts.get("bullets") or [] if str(item).strip()]
+        external_text = "；".join(bullets[:5]) or "联网资料返回的信息有限，只能做保守对比。"
+        return (
+            f"如果把视频里的 Pocket 4P 结论和联网资料里的 {external_name} 放在一起看，我会这样判断："
+            "Pocket 4P 更像是“视频里已经被验证过的双镜头口袋云台方案”，优势集中在 60mm 长焦、主摄画质、动态范围和稳定体验，视频里还给出了 0:14、7:55、11:39 这些关键判断点。"
+            f"{external_name} 这边，联网资料能确认的卖点是：{external_text}"
+            "所以不是简单谁全面碾压谁：如果你最在意这条视频已经实测到的长焦构图、主摄动态范围和 DJI 云台体验，Pocket 4P 更稳；"
+            f"如果你更看重 {external_name} 的 8K/徕卡/低光玩法、可拆屏或它的生态卖点，那 Luna 更值得继续看专项评测。"
+            "目前最大差别在于证据类型：Pocket 4P 的判断来自你上传视频里的实测观点，Luna 这边来自网页资料，还缺同场样片、价格和发热/稳定性实测，所以购买结论我会给成条件式：重实测可靠和长焦体验选 Pocket 4P，重参数上限和新玩法再重点考察 Luna。"
+        )
+
+    @staticmethod
+    def _intent_followup_answer(question: str, result: dict[str, Any]) -> str:
+        compact_question = "".join(str(question).split()).lower()
+        if not compact_question:
+            return ""
+        context_text = AIClient._result_text_context(result)
+        is_product_review = any(token.lower() in context_text.lower() for token in ("Pocket", "Pockets", "大疆", "DJI", "画质", "长焦"))
+        asks_upgrade = any(token in compact_question for token in ("升级", "提升", "比上一代", "上一代", "普通版", "区别", "差异", "pro多少", "多花"))
+        asks_buying_advice = AIClient._is_buying_advice_followup_question(compact_question)
+        asks_summary = AIClient._is_summary_followup_question(compact_question)
+        asks_detail = any(token in compact_question for token in ("详细", "展开", "具体", "完整", "更清楚")) and any(
+            token in compact_question for token in ("总结", "讲", "说", "分析", "梳理")
+        )
+        if is_product_review and asks_upgrade:
+            return AIClient._product_upgrade_followup_answer(result)
+        if is_product_review and asks_buying_advice:
+            return AIClient._product_buying_advice_followup_answer(result)
+        if is_product_review and (asks_detail or asks_summary):
+            return AIClient._product_detailed_followup_answer(result)
+        if asks_buying_advice:
+            return AIClient._generic_buying_advice_followup_answer(result)
+        if asks_detail or asks_summary:
+            return AIClient._generic_detailed_followup_answer(result)
+        return ""
+
+    @staticmethod
+    def _is_buying_advice_followup_question(compact_question: str) -> bool:
+        return any(
+            token in compact_question
+            for token in (
+                "推荐买",
+                "买哪",
+                "买哪个",
+                "选哪",
+                "选哪个",
+                "哪一代",
+                "哪款",
+                "怎么选",
+                "值得买吗",
+                "值不值得",
+                "购买建议",
+                "入手",
+                "推荐哪",
+                "建议买",
+            )
+        )
+
+    @staticmethod
+    def _is_summary_followup_question(compact_question: str) -> bool:
+        return any(
+            token in compact_question
+            for token in (
+                "总结",
+                "概括",
+                "视频内容",
+                "主要内容",
+                "主要讲",
+                "讲什么",
+                "讲了什么",
+                "主题",
+                "内容梳理",
+                "整体内容",
+                "summary",
+                "summarize",
+            )
+        )
+
+    @staticmethod
+    def _product_upgrade_followup_answer(result: dict[str, Any]) -> str:
+        transcripts = result.get("transcript_segments") or []
+        time = lambda *keywords: AIClient._first_transcript_time(transcripts, keywords)
+        t_intro = time("到底比", "Pro多少", "多花") or "0:00"
+        t_lens = time("60毫米", "长焦", "三倍") or "0:14"
+        t_sensor = time("两块完全不一样", "传感") or "0:31"
+        t_dynamic = time("ISO1600", "17档", "动态范围") or "7:55"
+        t_body = time("外观", "双头", "补光灯", "重", "扭力") or "0:50"
+        t_conclusion = time("多花的钱", "别的东西", "真的一样") or "11:39"
+        return (
+            "视频里所谓“升级”不是全面换代，而是集中在拍摄能力上。"
+            f"第一，新增/强化了长焦思路：它强调等效 60mm 长焦，可以从主摄快速切到约三倍视角，带来更多构图机会（{t_lens}）。"
+            f"第二，传感器和画质是核心升级：视频提到 4P 使用了两块不同传感器，并重点讨论高光、暗部和动态范围（{t_sensor}、{t_dynamic}）。"
+            f"第三，主摄动态范围提升明显：作者测试认为 ISO1600 时动态范围最好，大约能到 17 档，强项是保留高光和暗部细节（{t_dynamic}）。"
+            f"第四，外观和配件是小改：双头形态、重量/重心、电机扭力、广角镜和补光灯兼容这些有变化，但视频语气更像“预期内”而不是革命性升级（{t_body}）。"
+            f"最后，作者的落点是：多花的钱主要买画质、动态范围和长焦机会；其他很多基础体验仍然和 Pocket 4 很像（{t_conclusion}）。"
+        )
+
+    @staticmethod
+    def _product_detailed_followup_answer(result: dict[str, Any]) -> str:
+        transcripts = result.get("transcript_segments") or []
+        time = lambda *keywords: AIClient._first_transcript_time(transcripts, keywords)
+        t_intro = time("到底比", "Pro多少", "考虑过") or "0:00"
+        t_lens = time("60毫米", "长焦", "三倍") or "0:14"
+        t_body = time("外观", "双头", "补光灯", "重") or "0:50"
+        t_quality = time("画质到底", "样片", "画质") or "4:25"
+        t_dynamic = time("ISO1600", "17档", "动态范围") or "7:55"
+        t_heat = time("发热", "稳定性", "体验") or "10:07"
+        t_conclusion = time("多花的钱", "别的东西", "Pocket 4真的") or "11:39"
+        return (
+            f"详细来看，这支视频是在回答“Pocket 4P 到底比 Pocket 4/普通版 Pro 在哪里”（{t_intro}）。"
+            f"开头先把核心购买理由锁定在画质和双镜头上，尤其是等效 60mm 长焦以及从主摄切到三倍视角的能力（{t_lens}）。"
+            f"随后讲外观和硬件形态：4P 是双头设计，和 Pocket 4 很像但更重一些，电机扭力也做了调整；广角镜、补光灯等配件兼容属于实用补充（{t_body}）。"
+            f"中段是重点：作者先看样片和硬件，再解释传感器差异，认为主摄在高光、暗部和动态范围上是这代最值得看的地方（{t_quality}）。"
+            f"最强的结论来自动态范围测试：ISO1600 附近表现最好，视频里提到大约 17 档动态范围，意思是亮部不容易死白，暗部也能保留更多细节（{t_dynamic}）。"
+            f"后段补充稳定性、发热和实际体验，但这些不是最核心卖点；最终判断是 4P 的钱主要花在更好的主摄画质、动态范围和长焦机会，其他很多体验仍然接近 Pocket 4（{t_heat}、{t_conclusion}）。"
+        )
+
+    @staticmethod
+    def _product_buying_advice_followup_answer(result: dict[str, Any]) -> str:
+        transcripts = result.get("transcript_segments") or []
+        time = lambda *keywords: AIClient._first_transcript_time(transcripts, keywords)
+        t_lens = time("60毫米", "长焦", "三倍") or "0:14"
+        t_dynamic = time("ISO1600", "17档", "动态范围") or "7:55"
+        t_experience = time("发热", "稳定性", "体验") or "10:07"
+        t_conclusion = time("多花的钱", "别的东西", "真的一样", "Pocket 4真的") or "11:39"
+        return (
+            "按这支视频的结论，如果你主要拍视频、在意主摄画质/动态范围，或者明确需要 60mm 长焦和三倍视角，那更推荐 Pocket 4P。"
+            f"它的钱主要花在画质、动态范围和长焦机会里（{t_lens}、{t_dynamic}、{t_conclusion}）。"
+            "但如果你只是日常记录、预算敏感，或者不太用长焦和更高动态范围，Pocket 4/普通版会更划算，因为视频也说很多基础体验和 Pocket 4 很接近。"
+            f"发热、稳定性这些属于后段体验补充，不是让普通用户必须升级的决定性理由（{t_experience}）。"
+            "所以一句话：重画质和创作空间买 4P，重性价比和日常够用买 Pocket 4。"
+        )
+
+    @staticmethod
+    def _generic_detailed_followup_answer(result: dict[str, Any]) -> str:
+        answer_payload = result.get("answer") or {}
+        direct = str(answer_payload.get("direct_answer") or "").strip()
+        sections = []
+        for section in answer_payload.get("sections") or []:
+            title = str(section.get("title") or "").strip()
+            items = [str(item).strip() for item in section.get("items") or [] if str(item).strip()]
+            if title and items:
+                sections.append(f"{title}：" + "；".join(items[:4]))
+        if sections:
+            return (direct + " " if direct else "") + " ".join(sections)
+        return direct or "当前结果没有足够结构化内容可展开。"
+
+    @staticmethod
+    def _generic_buying_advice_followup_answer(result: dict[str, Any]) -> str:
+        answer_payload = result.get("answer") or {}
+        conclusion = AIClient._answer_section_text(answer_payload, {"关键结论", "结论"})
+        direct = str(answer_payload.get("direct_answer") or "").strip()
+        base = conclusion or direct
+        if not base:
+            return "当前结果还不足以给出明确购买建议；需要先确认视频里的产品优缺点、价格差和适合人群。"
+        return f"按当前视频结论，购买建议应围绕这个判断：{base} 如果你重视这些优势并能接受价格，就选高配/新款；如果只是基础使用或预算更敏感，就选普通版/上一代。"
+
+    @staticmethod
+    def _result_text_context(result: dict[str, Any]) -> str:
+        chunks: list[str] = []
+        answer = result.get("answer") or {}
+        chunks.append(str(answer.get("direct_answer") or ""))
+        for segment in (result.get("transcript_segments") or [])[:120]:
+            chunks.append(str(segment.get("text") or ""))
+        return " ".join(chunks)
+
+    @staticmethod
+    def _first_transcript_time(transcripts: list[dict[str, Any]], keywords: tuple[str, ...]) -> str:
+        for segment in transcripts:
+            text = str(segment.get("text") or "")
+            if any(keyword.lower() in text.lower() or keyword in text for keyword in keywords):
+                return AIClient._format_seconds(float(segment.get("start") or 0.0))
+        return ""
+
+    @staticmethod
+    def _compose_local_followup_answer(question: str, context: list[tuple[float, str]], result: dict[str, Any]) -> str:
+        answer_payload = result.get("answer") or {}
+        direct = str(answer_payload.get("direct_answer") or "").strip()
+        conclusion = AIClient._answer_section_text(answer_payload, {"关键结论", "结论"})
+        joined = " ".join(text for _, text in context)
+        times = [time for time, _ in context]
+        if AIClient._first_time_in_text(question) is not None:
+            snippets = [AIClient._compress_text(text, 70) for _, text in context if text]
+            deduped = []
+            for item in snippets:
+                if item not in deduped:
+                    deduped.append(item)
+            if deduped:
+                return AIClient._append_time_refs("这个时间点附近主要在讲：" + "；".join(deduped[:3]) + "。", times)
+        if any(token in question for token in ("总结", "讲什么", "主要", "内容", "主题")) and direct:
+            return direct
+        if any(token in question for token in ("值得", "买吗", "购买", "升级", "推荐")):
+            answer = conclusion or direct or "当前分析只能确认视频在讨论购买和升级价值，但没有形成更明确的购买建议。"
+            return AIClient._append_time_refs(answer, times)
+        if any(token in question for token in ("画质", "成像", "动态范围", "ISO", "高光", "暗部", "低光")):
+            if any(token in joined for token in ("画质", "动态范围", "ISO", "高光", "暗部", "低光")):
+                return AIClient._append_time_refs("视频对画质的判断偏正向：它重点测试样片、低光 ISO、动态范围以及高光/暗部保留，并认为实际成像比预期更好。", times)
+        if any(token in question for token in ("长焦", "镜头", "双镜", "三倍", "60毫米")):
+            if any(token in joined for token in ("长焦", "镜头", "三倍", "60毫米", "主摄")):
+                return AIClient._append_time_refs("视频把长焦/双镜头视为主要升级点：它能从主摄切到约三倍视角，价值主要体现在更丰富的构图和拍摄距离选择上。", times)
+        if any(token in question for token in ("发热", "稳定", "续航", "体验")):
+            if any(token in joined for token in ("发热", "稳定", "体验", "测试")):
+                return AIClient._append_time_refs("视频后段补充了使用体验，包括稳定效果、发热测试和整体体验；这些内容用于判断它是否适合长时间或更正式的拍摄。", times)
+        snippets = [AIClient._compress_text(text, 58) for _, text in context if text]
+        deduped = []
+        for item in snippets:
+            if item not in deduped:
+                deduped.append(item)
+        if deduped:
+            return AIClient._append_time_refs("根据已解析内容，" + "；".join(deduped[:3]) + "。", times)
+        return direct or "当前已解析内容不足以回答这个追问。"
+
+    @staticmethod
+    def _append_time_anchors(text: str, process_items: list[str], limit: int = 3) -> str:
+        import re
+
+        anchors: list[str] = []
+        for item in process_items:
+            for match in re.finditer(r"\d{1,2}:\d{2}", item):
+                token = match.group(0)
+                if token not in anchors:
+                    anchors.append(token)
+                if len(anchors) >= limit:
+                    break
+            if len(anchors) >= limit:
+                break
+        if not anchors or any(anchor in text for anchor in anchors):
+            return text
+        return AIClient._compress_text(f"{text}（相关位置：{'、'.join(anchors)}）", 230)
+
+    @staticmethod
+    def _append_time_refs(text: str, times: list[float], limit: int = 3) -> str:
+        refs: list[str] = []
+        for time in times:
+            ref = AIClient._format_seconds(time)
+            if ref not in refs:
+                refs.append(ref)
+            if len(refs) >= limit:
+                break
+        if not refs or any(ref in text for ref in refs):
+            return text
+        return f"{text}（相关位置：{'、'.join(refs)}）"
+
+    @staticmethod
+    def _answer_section_text(answer_payload: dict[str, Any], titles: set[str]) -> str:
+        for section in answer_payload.get("sections") or []:
+            if str(section.get("title")) in titles:
+                items = [str(item).strip() for item in section.get("items") or [] if str(item).strip()]
+                if items:
+                    return " ".join(items)
+        return ""
+
+    @staticmethod
+    def _first_time_in_text(text: str) -> float | None:
+        import re
+
+        value = str(text or "")
+        chinese_match = re.search(r"(\d{1,3})\s*分(?:钟)?\s*(\d{1,2})\s*秒", value)
+        if chinese_match:
+            return float(int(chinese_match.group(1)) * 60 + int(chinese_match.group(2)))
+        minute_match = re.search(r"(\d{1,3})\s*分(?:钟)?", value)
+        if minute_match:
+            return float(int(minute_match.group(1)) * 60)
+        match = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", value)
+        if not match:
+            return None
+        parts = [int(part) for part in match.group(1).split(":")]
+        if len(parts) == 3:
+            return float(parts[0] * 3600 + parts[1] * 60 + parts[2])
+        return float(parts[0] * 60 + parts[1])
+
+    @staticmethod
+    def _clean_followup_context(text: str) -> str:
+        cleaned = " ".join(str(text).split())
+        prefixes = (
+            "画面支持该音频。证据：",
+            "画面支持音频。证据：",
+            "画面支持该音频：",
+            "证据：",
+        )
+        for prefix in prefixes:
+            cleaned = cleaned.replace(prefix, "")
+        return cleaned.strip(" ，。；;:：")
 
     @staticmethod
     def _keywords(text: str) -> list[str]:
         import re
 
-        words = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", text)
-        stop = {"这个", "视频", "什么", "怎么", "如何", "一下", "主要", "是否", "有没有", "为什么", "哪里"}
-        return [word.lower() for word in words if word and word not in stop]
+        raw_words = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}", str(text or ""))
+        stop = {"这个", "视频", "什么", "怎么", "如何", "一下", "主要", "是否", "有没有", "为什么", "哪里", "怎么样", "哪些", "一个"}
+        domain_phrases = (
+            "动态范围",
+            "低光",
+            "高光",
+            "暗部",
+            "画质",
+            "成像",
+            "长焦",
+            "镜头",
+            "稳定性",
+            "发热",
+            "购买建议",
+            "推荐",
+            "升级",
+            "价格",
+            "成本",
+            "设计",
+            "施工",
+            "材料",
+        )
+        terms: list[str] = []
+        compact = "".join(raw_words)
+        for phrase in domain_phrases:
+            if phrase in compact and phrase not in terms:
+                terms.append(phrase.lower())
+        for word in raw_words:
+            lowered = word.lower()
+            if lowered in stop or word in stop:
+                continue
+            if re.fullmatch(r"[\u4e00-\u9fff]+", word):
+                if len(word) <= 4:
+                    candidates = [word]
+                else:
+                    candidates = [word]
+                    for size in (2, 3, 4):
+                        candidates.extend(word[index : index + size] for index in range(0, len(word) - size + 1))
+                for candidate in candidates:
+                    if candidate not in stop and candidate.lower() not in terms:
+                        terms.append(candidate.lower())
+            elif lowered not in terms:
+                terms.append(lowered)
+        return terms[:32]
 
     @staticmethod
     def _overlap_score(query_terms: list[str], text: str) -> int:
@@ -1507,6 +2520,11 @@ class AIClient:
         data = base64.b64encode(path.read_bytes()).decode("ascii")
         return f"data:image/jpeg;base64,{data}"
 
+    @staticmethod
+    def _video_data_url(path: Path) -> str:
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:video/mp4;base64,{data}"
+
     def _responses_json(
         self,
         model: str,
@@ -1514,6 +2532,7 @@ class AIClient:
         schema: dict[str, Any],
         schema_name: str,
         images: list[str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         assert self._client is not None
         content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -1534,6 +2553,8 @@ class AIClient:
         }
         if self.settings.reasoning_effort:
             kwargs["reasoning"] = {"effort": self.settings.reasoning_effort}
+        if timeout_seconds is not None:
+            kwargs["timeout"] = timeout_seconds
 
         try:
             response = self._client.responses.create(

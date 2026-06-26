@@ -1,24 +1,21 @@
 import {
   Activity,
   AlertCircle,
-  CheckCircle2,
-  Clock3,
-  FileAudio,
-  Gauge,
-  Image as ImageIcon,
-  Link as LinkIcon,
+  Globe2,
   Loader2,
-  MessageSquareText,
   Play,
-  SearchCheck,
+  Radio,
   Send,
-  UploadCloud
+  Square,
+  UploadCloud,
+  Video
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type JobStatus = "queued" | "running" | "succeeded" | "failed";
-type SourceMode = "file" | "url";
 type LiveStatus = "queued" | "running" | "streaming" | "stopping" | "stopped" | "succeeded" | "failed";
+type ComposerMode = "video" | "live";
 
 type Job = {
   job_id: string;
@@ -27,45 +24,6 @@ type Job = {
   progress: number;
   current_node: string;
   error?: string | null;
-};
-
-type Probe = {
-  type?: string;
-  event_index?: number;
-  label?: string;
-  window_start?: number;
-  window_end?: number;
-  question?: string;
-  expected_visuals?: string[];
-  audio_evidence?: string;
-  user_question?: string;
-};
-
-type Frame = {
-  time: number;
-  filename: string;
-  url: string;
-  reason: string;
-  probe?: Probe | null;
-  observation?: {
-    scene: string;
-    objects: string[];
-    actions: string[];
-    visible_text: string[];
-    audio_alignment: "match" | "conflict" | "uncertain";
-    visual_target?: string;
-    evidence_assessment?: string;
-    notes: string;
-  } | null;
-};
-
-type TranscriptSegment = {
-  start: number;
-  end: number;
-  speaker?: string;
-  text: string;
-  confidence?: number | null;
-  source?: string;
 };
 
 type Result = {
@@ -80,10 +38,7 @@ type Result = {
     summary: string;
     evidence_refs: string[];
     uncertainties: string[];
-    sections?: Array<{
-      title: string;
-      items: string[];
-    }>;
+    sections?: Array<{ title: string; items: string[] }>;
   } | null;
   timeline: Array<{
     time: number;
@@ -93,8 +48,25 @@ type Result = {
     expected_visuals: string[];
     visual_question?: string;
   }>;
-  transcript_segments?: TranscriptSegment[];
-  frames: Frame[];
+  transcript_segments?: Array<{
+    start: number;
+    end: number;
+    speaker?: string;
+    text: string;
+    confidence?: number | null;
+    source?: string;
+  }>;
+  frames: Array<{
+    time: number;
+    filename: string;
+    url: string;
+    reason: string;
+    observation?: {
+      scene?: string;
+      evidence_assessment?: string;
+      notes?: string;
+    } | null;
+  }>;
   prediction_checks: Array<{
     window_start: number;
     window_end: number;
@@ -119,28 +91,20 @@ type Result = {
     status?: string;
     reason?: string;
     method?: string;
-    api_attempted?: boolean;
-    chat_audio_attempted?: boolean;
-    local_attempted?: boolean;
-    api_error?: string;
-    local_error?: string;
     segment_count?: number;
-    attempts?: Array<Record<string, unknown>>;
   };
 };
 
-type ChatMessage = {
-  role: "user" | "assistant";
-  text: string;
-  evidence?: string[];
-  coverage?: string;
-};
-
-type CoverageRow = {
-  start: string;
-  end?: string;
-  title: string;
-  text: string;
+type LiveViolation = {
+  source?: "audio" | "visual" | string;
+  category: string;
+  category_label?: string;
+  severity?: "low" | "medium" | "high" | string;
+  confidence?: number;
+  evidence?: string;
+  matched_text?: string;
+  context?: string;
+  visible_text?: string[];
 };
 
 type LiveSegment = {
@@ -153,19 +117,45 @@ type LiveSegment = {
   transcript_seconds?: number;
   vision_seconds?: number;
   analysis_seconds?: number;
-  capture?: {
-    mode?: string;
-    capture_seconds?: number;
-  };
   frame?: {
     time: number;
     filename: string;
     url: string;
     reason: string;
   };
-  observation?: {
-    scene?: string;
-    evidence_assessment?: string;
+  moderation?: {
+    has_risk: boolean;
+    risk_level: "none" | "low" | "medium" | "high" | string;
+    violations: LiveViolation[];
+    summary?: string;
+  };
+};
+
+type LiveModel = {
+  status: "warming_up" | "ready";
+  program_type: string;
+  current_focus: string;
+  stable_summary: string;
+  confidence: number;
+  evidence_count: number;
+  audio_evidence_count: number;
+  visual_evidence_count: number;
+  segment_count: number;
+  risk_state?: {
+    status?: "clear" | "alert" | string;
+    scanned_segments?: number;
+    risk_segments?: number;
+    last_alert_time?: number | null;
+    highest_level?: string;
+    category_counts?: Record<string, number>;
+    recent_alerts?: Array<{
+      segment_index?: number;
+      time?: number;
+      risk_level?: string;
+      categories?: string[];
+      summary?: string;
+      violations?: LiveViolation[];
+    }>;
   };
 };
 
@@ -177,8 +167,27 @@ type LiveSession = {
   current_node: string;
   error?: string | null;
   resolved_url?: string | null;
+  live_model?: LiveModel;
   segments: LiveSegment[];
 };
+
+type ChatMessage = {
+  role: "user" | "assistant" | "system";
+  text: string;
+  meta?: string;
+};
+
+type PendingLive = {
+  url: string;
+};
+
+type PendingVideoQuestion = {
+  text: string;
+  useWebSearch: boolean;
+};
+
+const PREPARE_VIDEO_QUESTION = "用户稍后会在对话中提问；请先解析视频内容，准备支持问答。";
+const DEFAULT_LIVE_MONITOR = "实时监控直播是否出现违禁词、粗口、擦边、抽烟、暴力、危险行为等风险；只有命中风险时保留证据。";
 
 const nodeLabels: Record<string, string> = {
   queued: "排队中",
@@ -194,42 +203,47 @@ const nodeLabels: Record<string, string> = {
   observe_frames: "观察关键画面",
   predict_next_events: "推演后续片段",
   verify_predictions: "检查覆盖情况",
-  synthesize_answer: "生成总结",
+  synthesize_answer: "生成回答",
   complete: "完成",
   failed: "失败"
 };
 
 export function App() {
-  const [sourceMode, setSourceMode] = useState<SourceMode>("file");
-  const [video, setVideo] = useState<File | null>(null);
-  const [videoUrl, setVideoUrl] = useState("");
-  const [question, setQuestion] = useState("这个视频主要发生了什么？请按时间线总结，并给出关键证据。");
+  const [composerMode, setComposerMode] = useState<ComposerMode>("video");
   const [job, setJob] = useState<Job | null>(null);
   const [result, setResult] = useState<Result | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [chat, setChat] = useState<ChatMessage[]>([]);
-  const [followup, setFollowup] = useState("");
-  const [asking, setAsking] = useState(false);
-  const [liveUrl, setLiveUrl] = useState("https://live.douyin.com/547977714661");
-  const [liveQuestion, setLiveQuestion] = useState("实时总结直播中正在发生什么，关注主播动作、商品/场景变化、屏幕文字和语音重点。");
-  const [liveWindow, setLiveWindow] = useState(2);
-  const [liveMaxSegments, setLiveMaxSegments] = useState(0);
-  const [liveSubmitting, setLiveSubmitting] = useState(false);
   const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
+  const [pendingLive, setPendingLive] = useState<PendingLive | null>(null);
+  const [chat, setChat] = useState<ChatMessage[]>([
+    {
+      role: "assistant",
+      text: "选择上传本地视频，或切到直播 URL。视频会先在后台解析，然后你可以连续提问；直播会先问你要监控什么，再开始实时扫描。"
+    }
+  ]);
+  const [input, setInput] = useState("");
+  const [pendingVideoQuestions, setPendingVideoQuestions] = useState<PendingVideoQuestion[]>([]);
+  const [useWebSearch, setUseWebSearch] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const [liveSubmitting, setLiveSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [liveError, setLiveError] = useState<string | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const partialTimerRef = useRef<number | null>(null);
-  const liveEventSourceRef = useRef<EventSource | null>(null);
 
-  const statusLabel = useMemo(() => {
-    if (!job) return sourceMode === "file" ? "等待上传" : "等待 URL";
-    if (job.status === "failed") return "分析失败";
-    if (job.status === "succeeded") return "分析完成";
-    return labelForNode(job.current_node);
-  }, [job, sourceMode]);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const liveEventSourceRef = useRef<EventSource | null>(null);
+  const partialTimerRef = useRef<number | null>(null);
+  const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const pendingVideoQuestionsRef = useRef<PendingVideoQuestion[]>([]);
+  const useWebSearchRef = useRef(false);
 
   const sourceVideoUrl = job ? `/api/jobs/${job.job_id}/source` : null;
+  const status = useMemo(() => statusText(job, liveSession, composerMode, pendingLive), [job, liveSession, composerMode, pendingLive]);
+  const progress = job?.progress ?? (liveSession ? 100 : 0);
+  const mediaTitle = liveSession ? "直播监控" : job ? "视频解析" : pendingLive ? "等待监控目标" : "等待媒体";
+  const mediaSubtitle = liveSession?.source_url || pendingLive?.url || (job ? "视频正在后台解析，可先输入问题。" : "上方会播放视频；直播接入后显示实时状态。");
+  const hasRunningTask = job?.status === "queued" || job?.status === "running" || liveSession?.status === "queued" || liveSession?.status === "running" || liveSession?.status === "streaming";
 
   useEffect(() => {
     return () => {
@@ -239,52 +253,243 @@ export function App() {
     };
   }, []);
 
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (sourceMode === "file" && !video) {
-      setError("请选择一个视频文件。");
-      return;
-    }
-    if (sourceMode === "url" && !videoUrl.trim()) {
-      setError("请输入一个视频 URL。");
-      return;
-    }
-    setSubmitting(true);
-    setError(null);
-    setResult(null);
-    setJob(null);
-    setChat([]);
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [chat, result?.answer?.direct_answer, liveSession?.live_model?.stable_summary, liveSession?.segments.length]);
 
+  useEffect(() => {
+    useWebSearchRef.current = useWebSearch;
+  }, [useWebSearch]);
+
+  function appendMessage(message: ChatMessage) {
+    setChat((items) => [...items, message]);
+  }
+
+  function resetVideoState() {
+    eventSourceRef.current?.close();
+    stopPartialPolling();
+    setJob(null);
+    setResult(null);
+    setError(null);
+    clearPendingVideoQuestions();
+  }
+
+  function resetLiveState() {
+    liveEventSourceRef.current?.close();
+    setLiveSession(null);
+    setPendingLive(null);
+    setLiveError(null);
+  }
+
+  async function handleVideoSelected(file: File | null) {
+    if (!file) return;
+    setComposerMode("video");
+    resetVideoState();
+    resetLiveState();
+    setChat([
+      { role: "user", text: `上传本地视频：${file.name}` },
+      { role: "assistant", text: "收到，我会先在后台解析音频和关键画面。你现在可以直接问这个视频的问题。" }
+    ]);
+    setSubmitting(true);
     try {
-      const payload = sourceMode === "file" ? await createFileJob() : await createUrlJob();
-      subscribe(payload.job_id);
+      const payload = await createFileJob(file, PREPARE_VIDEO_QUESTION);
+      subscribeJob(payload.job_id);
     } catch (err) {
-      setError(errorMessage(err, sourceMode === "url" ? "URL 创建任务失败。" : "上传失败。"));
+      const message = errorMessage(err, "上传失败。");
+      setError(message);
+      appendMessage({ role: "assistant", text: message });
+    } finally {
+      setSubmitting(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function handleComposerSubmit(event: FormEvent) {
+    event.preventDefault();
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+
+    if (composerMode === "live") {
+      await handleLiveComposer(text);
+      return;
+    }
+    await handleVideoComposer(text);
+  }
+
+  async function handleVideoComposer(text: string) {
+    if (!job && !result) {
+      if (!isLikelyUrl(text)) {
+        setChat((items) => [
+          ...items,
+          { role: "user", text },
+          { role: "assistant", text: "先上传本地视频，或直接发一个视频网页/直链 URL；解析完成后我会按你的问题回答。" }
+        ]);
+        return;
+      }
+      await startVideoUrlJob(text);
+      return;
+    }
+    if (job && job.status !== "succeeded") {
+      enqueuePendingVideoQuestion(text);
+      setChat((items) => [
+        ...items,
+        { role: "user", text },
+        { role: "assistant", text: "我先记下这个问题。后台解析完成后，我会基于完整音频和关键画面来回答。" }
+      ]);
+      return;
+    }
+    await askVideoQuestion(text);
+  }
+
+  async function handleLiveComposer(text: string) {
+    if (pendingLive) {
+      await startLiveSession(pendingLive.url, text);
+      return;
+    }
+    if (!liveSession) {
+      if (!isLikelyUrl(text)) {
+        setChat((items) => [
+          ...items,
+          { role: "user", text },
+          { role: "assistant", text: "先发我直播 URL。接入后我会让你确认要监控什么。" }
+        ]);
+        return;
+      }
+      resetVideoState();
+      setPendingLive({ url: text });
+      setChat((items) => [
+        ...items,
+        { role: "user", text: `接入直播 URL：${text}` },
+        { role: "assistant", text: "收到。你需要监控什么？例如：违禁词、粗口、擦边、抽烟、危险行为。" }
+      ]);
+      return;
+    }
+    setChat((items) => [
+      ...items,
+      { role: "user", text },
+      { role: "assistant", text: `收到。当前直播已经按原目标运行；这条补充我先记录为新的关注点：${text}` }
+    ]);
+  }
+
+  async function startVideoUrlJob(url: string) {
+    const trimmed = url.trim();
+    setComposerMode("video");
+    resetVideoState();
+    resetLiveState();
+    setChat([
+      { role: "user", text: `解析视频 URL：${trimmed}` },
+      { role: "assistant", text: "收到，我会先下载并解析这个视频。解析过程中也可以直接继续提问。" }
+    ]);
+    setSubmitting(true);
+    try {
+      const response = await fetch("/api/jobs/url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: trimmed, question: PREPARE_VIDEO_QUESTION })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as { job_id: string };
+      subscribeJob(payload.job_id);
+    } catch (err) {
+      const message = errorMessage(err, "URL 创建任务失败。");
+      setError(message);
+      appendMessage({ role: "assistant", text: message });
     } finally {
       setSubmitting(false);
     }
   }
 
-  async function createFileJob() {
+  async function askVideoQuestion(question: string) {
+    const jobId = job?.job_id ?? result?.job_id;
+    if (!jobId) return;
+    setChat((items) => [...items, { role: "user", text: question }]);
+    await answerVideoQuestion(jobId, question, useWebSearchRef.current);
+  }
+
+  async function answerVideoQuestion(jobId: string, question: string, useWeb = useWebSearchRef.current) {
+    setAsking(true);
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, use_web_search: useWeb })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as { answer: { answer: string; web_sources?: string[] } };
+      setChat((items) => [
+        ...items,
+        {
+          role: "assistant",
+          text: payload.answer.answer,
+          meta: useWeb && payload.answer.web_sources?.length ? `联网参考：${payload.answer.web_sources.slice(0, 2).join("、")}` : undefined
+        }
+      ]);
+    } catch (err) {
+      setChat((items) => [...items, { role: "assistant", text: errorMessage(err, "追问失败。") }]);
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  function enqueuePendingVideoQuestion(question: string) {
+    pendingVideoQuestionsRef.current = [...pendingVideoQuestionsRef.current, { text: question, useWebSearch: useWebSearchRef.current }];
+    setPendingVideoQuestions(pendingVideoQuestionsRef.current);
+  }
+
+  function clearPendingVideoQuestions() {
+    pendingVideoQuestionsRef.current = [];
+    setPendingVideoQuestions([]);
+  }
+
+  async function startLiveSession(url: string, monitorQuestion: string) {
+    const target = monitorQuestion.trim() || DEFAULT_LIVE_MONITOR;
+    setComposerMode("live");
+    resetVideoState();
+    setPendingLive(null);
+    setLiveSession(null);
+    setLiveError(null);
+    setChat((items) => [
+      ...items,
+      { role: "user", text: target },
+      { role: "assistant", text: `开始监控。目标：${target}` }
+    ]);
+    setLiveSubmitting(true);
+    try {
+      const response = await fetch("/api/live/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, question: target, window_seconds: 2, max_segments: 0 })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const payload = (await response.json()) as { session_id: string };
+      subscribeLive(payload.session_id);
+    } catch (err) {
+      const message = errorMessage(err, "直播监控启动失败。");
+      setLiveError(message);
+      appendMessage({ role: "assistant", text: message });
+    } finally {
+      setLiveSubmitting(false);
+    }
+  }
+
+  async function stopLive() {
+    if (!liveSession) return;
+    await fetch(`/api/live/sessions/${liveSession.session_id}/stop`, { method: "POST" });
+    liveEventSourceRef.current?.close();
+    appendMessage({ role: "assistant", text: "已发送停止指令。" });
+  }
+
+  async function createFileJob(file: File, question: string) {
     const body = new FormData();
-    if (video) body.append("video", video);
+    body.append("video", file);
     body.append("question", question);
     const response = await fetch("/api/jobs", { method: "POST", body });
     if (!response.ok) throw new Error(await response.text());
     return (await response.json()) as { job_id: string };
   }
 
-  async function createUrlJob() {
-    const response = await fetch("/api/jobs/url", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: videoUrl.trim(), question })
-    });
-    if (!response.ok) throw new Error(await response.text());
-    return (await response.json()) as { job_id: string };
-  }
-
-  function subscribe(jobId: string) {
+  function subscribeJob(jobId: string) {
     eventSourceRef.current?.close();
     stopPartialPolling();
     const source = new EventSource(`/api/jobs/${jobId}/events`);
@@ -297,18 +502,35 @@ export function App() {
         source.close();
         stopPartialPolling();
         const response = await fetch(`/api/jobs/${nextJob.job_id}/result`);
-        if (response.ok) setResult((await response.json()) as Result);
+        if (response.ok) {
+          const payload = (await response.json()) as Result;
+          setResult(payload);
+          const queuedQuestions = [...pendingVideoQuestionsRef.current];
+          clearPendingVideoQuestions();
+          if (queuedQuestions.length > 0) {
+            appendMessage({ role: "assistant", text: `后台解析完成。我现在回答刚才记下的 ${queuedQuestions.length} 个问题。` });
+            for (const queuedQuestion of queuedQuestions) {
+              await answerVideoQuestion(nextJob.job_id, queuedQuestion.text, queuedQuestion.useWebSearch);
+            }
+          } else {
+            appendMessage({ role: "assistant", text: "后台解析完成。你可以继续问更具体的问题，我会尽量按你的问题来分析。" });
+          }
+        }
       }
       if (nextJob.status === "failed") {
         source.close();
         stopPartialPolling();
-        setError(nextJob.error ?? "任务失败。");
+        const message = nextJob.error ?? "任务失败。";
+        setError(message);
+        appendMessage({ role: "assistant", text: message });
       }
     };
     source.onerror = () => {
       source.close();
       stopPartialPolling();
-      setError("进度连接中断，请刷新任务状态。");
+      const message = "进度连接中断，请刷新任务状态。";
+      setError(message);
+      appendMessage({ role: "assistant", text: message });
     };
   }
 
@@ -321,7 +543,7 @@ export function App() {
           setResult((current) => mergePartialResult(current, payload));
         }
       } catch {
-        // SSE still owns fatal progress errors; partial polling is best-effort.
+        // SSE owns fatal progress errors; partial polling only keeps context fresh.
       }
     };
     void poll();
@@ -335,71 +557,6 @@ export function App() {
     }
   }
 
-  async function askFollowup(event: FormEvent) {
-    event.preventDefault();
-    const text = followup.trim();
-    const jobId = job?.job_id ?? result?.job_id;
-    if (!text || !jobId) return;
-    setChat((items) => [...items, { role: "user", text }]);
-    setFollowup("");
-    setAsking(true);
-    try {
-      const response = await fetch(`/api/jobs/${jobId}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: text })
-      });
-      if (!response.ok) throw new Error(await response.text());
-      const payload = (await response.json()) as {
-        answer: { answer: string; evidence_refs?: string[]; coverage_note?: string };
-      };
-      setChat((items) => [
-        ...items,
-        {
-          role: "assistant",
-          text: payload.answer.answer,
-          evidence: payload.answer.evidence_refs ?? [],
-          coverage: payload.answer.coverage_note
-        }
-      ]);
-    } catch (err) {
-      setChat((items) => [...items, { role: "assistant", text: errorMessage(err, "追问失败。") }]);
-    } finally {
-      setAsking(false);
-    }
-  }
-
-  async function startLive(event: FormEvent) {
-    event.preventDefault();
-    if (!liveUrl.trim()) {
-      setLiveError("请输入直播 URL 或 m3u8/flv 直链。");
-      return;
-    }
-    setLiveSubmitting(true);
-    setLiveError(null);
-    setLiveSession(null);
-    liveEventSourceRef.current?.close();
-    try {
-      const response = await fetch("/api/live/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: liveUrl.trim(),
-          question: liveQuestion.trim(),
-          window_seconds: liveWindow,
-          max_segments: liveMaxSegments
-        })
-      });
-      if (!response.ok) throw new Error(await response.text());
-      const payload = (await response.json()) as { session_id: string };
-      subscribeLive(payload.session_id);
-    } catch (err) {
-      setLiveError(errorMessage(err, "直播分析启动失败。"));
-    } finally {
-      setLiveSubmitting(false);
-    }
-  }
-
   function subscribeLive(sessionId: string) {
     liveEventSourceRef.current?.close();
     const source = new EventSource(`/api/live/sessions/${sessionId}/events`);
@@ -409,7 +566,9 @@ export function App() {
       setLiveSession(payload);
       if (payload.status === "failed") {
         source.close();
-        setLiveError(payload.error ?? "直播分析失败。");
+        const message = payload.error ?? "直播监控失败。";
+        setLiveError(message);
+        appendMessage({ role: "assistant", text: message });
       }
       if (["stopped", "succeeded"].includes(payload.status)) {
         source.close();
@@ -417,404 +576,208 @@ export function App() {
     };
     source.onerror = () => {
       source.close();
-      setLiveError("直播事件连接中断，请重新启动直播分析。");
+      const message = "直播事件连接中断，请重新启动直播监控。";
+      setLiveError(message);
+      appendMessage({ role: "assistant", text: message });
     };
   }
 
-  async function stopLive() {
-    if (!liveSession) return;
-    await fetch(`/api/live/sessions/${liveSession.session_id}/stop`, { method: "POST" });
-    liveEventSourceRef.current?.close();
+  function seekSourceVideo(seconds: number) {
+    const player = sourceVideoRef.current;
+    if (!player) return;
+    const safeSeconds = Math.max(0, seconds);
+    const jump = () => {
+      player.currentTime = safeSeconds;
+      player.scrollIntoView({ behavior: "smooth", block: "center" });
+      void player.play().catch(() => undefined);
+    };
+    if (player.readyState === 0) {
+      player.addEventListener("loadedmetadata", jump, { once: true });
+      player.load();
+      return;
+    }
+    jump();
   }
 
   return (
     <main className="app-shell">
-      <section className="workspace">
-        <div className="topbar">
+      <section className="workspace-shell">
+        <header className="topbar">
           <div>
-            <p className="eyebrow">LangGraph multimodal harness</p>
-            <h1>Audio-First Video Agent</h1>
+            <p className="eyebrow">Audio-first multimodal agent</p>
+            <h1>视频/直播问答工作台</h1>
           </div>
-          <div className="status-pill" title="当前任务状态">
-            {job?.status === "running" || job?.status === "queued" ? (
-              <Loader2 className="spin" size={16} />
-            ) : (
-              <Activity size={16} />
-            )}
-            <span>{statusLabel}</span>
+          <div className="status-pill" title="当前状态">
+            {hasRunningTask || submitting || asking || liveSubmitting ? <Loader2 className="spin" size={16} /> : <Activity size={16} />}
+            <span>{status}</span>
           </div>
-        </div>
+        </header>
 
-        <div className="main-grid">
-          <form className="upload-panel" onSubmit={submit}>
-            <div className="source-tabs" role="tablist" aria-label="视频来源">
-              <button type="button" className={sourceMode === "file" ? "active" : ""} onClick={() => setSourceMode("file")}>
-                <UploadCloud size={16} /> 文件
+        <section className="player-panel">
+          <div className="player-frame">
+            {sourceVideoUrl ? (
+              <video key={`${sourceVideoUrl}-${job?.status}`} ref={sourceVideoRef} className="source-video" src={sourceVideoUrl} controls preload="metadata" />
+            ) : liveSession ? (
+              <LiveStage session={liveSession} />
+            ) : pendingLive ? (
+              <EmptyStage icon={<Radio size={32} />} title="直播 URL 已收到" subtitle="请在下面输入要监控的目标，之后才会开始扫描。" />
+            ) : (
+              <EmptyStage icon={<Play size={32} />} title="等待视频或直播" subtitle="上传本地视频，或切到直播 URL 开始。" />
+            )}
+          </div>
+          <div className="media-meta">
+            <div>
+              <strong>{mediaTitle}</strong>
+              <span>{mediaSubtitle}</span>
+            </div>
+            <div className="mini-progress" aria-label="分析进度">
+              <span>{job ? `${job.progress}%` : liveSession ? liveStatusLabel(liveSession.status) : pendingLive ? "待确认" : "待开始"}</span>
+              <div><i style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} /></div>
+            </div>
+          </div>
+          {(error || liveError) && (
+            <div className="error-line" role="alert">
+              <AlertCircle size={16} />
+              <span>{error || liveError}</span>
+            </div>
+          )}
+        </section>
+
+        <section className="conversation-panel">
+          <div className="chat-list" aria-live="polite">
+            {chat.map((message, index) => (
+              <article className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
+                <p>{renderTimeLinkedText(message.text, seekSourceVideo)}</p>
+                {message.meta && <small>{message.meta}</small>}
+              </article>
+            ))}
+            {liveSession?.live_model && <LiveModelMessage session={liveSession} />}
+            {(asking || submitting || liveSubmitting) && <ThinkingMessage label={thinkingLabel(asking, submitting, liveSubmitting, useWebSearch)} />}
+            <div ref={chatEndRef} />
+          </div>
+
+          <form className="composer" onSubmit={handleComposerSubmit}>
+            <input ref={fileInputRef} type="file" accept="video/*" hidden onChange={(event) => void handleVideoSelected(event.target.files?.[0] ?? null)} />
+            <div className="composer-tools" role="tablist" aria-label="输入来源">
+              <button
+                type="button"
+                className={composerMode === "video" ? "active" : ""}
+                onClick={() => {
+                  setComposerMode("video");
+                  setPendingLive(null);
+                }}
+              >
+                <Video size={16} /> 视频问答
               </button>
-              <button type="button" className={sourceMode === "url" ? "active" : ""} onClick={() => setSourceMode("url")}>
-                <LinkIcon size={16} /> URL
+              <button
+                type="button"
+                className={composerMode === "live" ? "active" : ""}
+                onClick={() => {
+                  setComposerMode("live");
+                  resetVideoState();
+                }}
+              >
+                <Radio size={16} /> 直播监控
+              </button>
+              <button type="button" onClick={() => fileInputRef.current?.click()} disabled={submitting || liveSubmitting}>
+                <UploadCloud size={16} /> 上传本地视频
+              </button>
+              <button
+                type="button"
+                className={`web-tool ${useWebSearch ? "active" : ""}`}
+                onClick={() => setUseWebSearch((value) => !value)}
+                aria-pressed={useWebSearch}
+                title="回答视频问题时结合联网搜索"
+              >
+                <Globe2 size={16} /> {useWebSearch ? "联网增强" : "仅视频库"}
+              </button>
+              {liveSession && ["queued", "running", "streaming"].includes(liveSession.status) && (
+                <button type="button" className="danger-tool" onClick={() => void stopLive()}>
+                  <Square size={14} /> 停止直播
+                </button>
+              )}
+            </div>
+            <div className="composer-row">
+              <input
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                placeholder={composerPlaceholder(composerMode, Boolean(job || result), Boolean(pendingLive), Boolean(liveSession), pendingVideoQuestions.length)}
+              />
+              <button type="submit" disabled={asking || submitting || liveSubmitting || !input.trim()} aria-label="发送">
+                {asking || submitting || liveSubmitting ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
               </button>
             </div>
-
-            {sourceMode === "file" ? (
-              <label className="drop-zone">
-                <input
-                  type="file"
-                  accept="video/*"
-                  onChange={(event) => setVideo(event.target.files?.[0] ?? null)}
-                />
-                <UploadCloud size={28} />
-                <span>{video ? video.name : "选择 1 到 30 分钟的视频"}</span>
-              </label>
-            ) : (
-              <label className="url-box">
-                <span>
-                  <LinkIcon size={16} /> 视频 URL
-                </span>
-                <input
-                  type="url"
-                  value={videoUrl}
-                  onChange={(event) => setVideoUrl(event.target.value)}
-                  placeholder="https://example.com/video.mp4"
-                />
-                <small>直链 mp4/webm/mov 可直接下载；站点页面链接会尝试 yt-dlp。</small>
-              </label>
-            )}
-
-            <label className="question-box">
-              <span>
-                <MessageSquareText size={16} /> 问题
-              </span>
-              <textarea value={question} onChange={(event) => setQuestion(event.target.value)} rows={5} />
-            </label>
-
-            <button className="primary-action" type="submit" disabled={submitting || (sourceMode === "file" ? !video : !videoUrl.trim())}>
-              {submitting ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-              <span>{submitting ? "提交中" : "开始分析"}</span>
-            </button>
           </form>
-
-          <section className="progress-panel">
-            <div className="progress-header">
-              <Gauge size={18} />
-              <span>{job ? `${job.progress}%` : "0%"}</span>
-            </div>
-            <div className="progress-track">
-              <div style={{ width: `${job?.progress ?? 0}%` }} />
-            </div>
-            <div className="stage-list">
-              {[
-                "download_url",
-                "transcribe_audio",
-                "generate_frame_candidates",
-                "plan_keyframes",
-                "observe_frames",
-                "synthesize_answer"
-              ].map((node) => (
-                <div className={isActiveNode(job?.current_node, node) ? "stage active" : "stage"} key={node}>
-                  <Clock3 size={14} />
-                  <span>{nodeLabels[node]}</span>
-                </div>
-              ))}
-            </div>
-            {sourceVideoUrl && (
-              <video className="source-preview" src={sourceVideoUrl} controls preload="metadata" />
-            )}
-            {error && (
-              <div className="error-line" role="alert">
-                <AlertCircle size={16} />
-                <span>{error}</span>
-              </div>
-            )}
-            {result?.metadata.mock_mode && (
-              <div className="mock-line">
-                <AlertCircle size={16} />
-                <span>当前是 mock 模式，适合验证界面和流程。</span>
-              </div>
-            )}
-          </section>
-        </div>
-
-        {result && <ResultView result={result} chat={chat} followup={followup} asking={asking} setFollowup={setFollowup} askFollowup={askFollowup} />}
-        <LiveWorkbench
-          liveUrl={liveUrl}
-          setLiveUrl={setLiveUrl}
-          liveQuestion={liveQuestion}
-          setLiveQuestion={setLiveQuestion}
-          liveWindow={liveWindow}
-          setLiveWindow={setLiveWindow}
-          liveMaxSegments={liveMaxSegments}
-          setLiveMaxSegments={setLiveMaxSegments}
-          liveSubmitting={liveSubmitting}
-          liveSession={liveSession}
-          liveError={liveError}
-          startLive={startLive}
-          stopLive={stopLive}
-        />
+        </section>
       </section>
     </main>
   );
 }
 
-function LiveWorkbench({
-  liveUrl,
-  setLiveUrl,
-  liveQuestion,
-  setLiveQuestion,
-  liveWindow,
-  setLiveWindow,
-  liveMaxSegments,
-  setLiveMaxSegments,
-  liveSubmitting,
-  liveSession,
-  liveError,
-  startLive,
-  stopLive
-}: {
-  liveUrl: string;
-  setLiveUrl: (value: string) => void;
-  liveQuestion: string;
-  setLiveQuestion: (value: string) => void;
-  liveWindow: number;
-  setLiveWindow: (value: number) => void;
-  liveMaxSegments: number;
-  setLiveMaxSegments: (value: number) => void;
-  liveSubmitting: boolean;
-  liveSession: LiveSession | null;
-  liveError: string | null;
-  startLive: (event: FormEvent) => void;
-  stopLive: () => void;
-}) {
-  const running = liveSession?.status === "running" || liveSession?.status === "queued" || liveSession?.status === "streaming";
+function EmptyStage({ icon, title, subtitle }: { icon: ReactNode; title: string; subtitle: string }) {
   return (
-    <section className="live-band">
-      <div className="section-title">
-        <Activity size={18} />
-        <h2>直播实时分析</h2>
-      </div>
-      <form className="live-form" onSubmit={startLive}>
-        <label>
-          <span>直播 URL</span>
-          <input value={liveUrl} onChange={(event) => setLiveUrl(event.target.value)} placeholder="https://live.douyin.com/... 或 m3u8/flv" />
-        </label>
-        <label>
-          <span>实时关注点</span>
-          <textarea value={liveQuestion} onChange={(event) => setLiveQuestion(event.target.value)} rows={3} />
-        </label>
-        <div className="live-controls">
-          <label>
-            <span>窗口秒数</span>
-            <input type="number" min={1} max={12} value={liveWindow} onChange={(event) => setLiveWindow(Number(event.target.value) || 2)} />
-          </label>
-          <label>
-            <span>最大段数</span>
-            <input type="number" min={0} max={200} value={liveMaxSegments} onChange={(event) => setLiveMaxSegments(Number(event.target.value) || 0)} />
-          </label>
-          <button className="primary-action live-action" type="submit" disabled={liveSubmitting || running}>
-            {liveSubmitting || running ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-            <span>{running ? "分析中" : "开始直播分析"}</span>
-          </button>
-          {liveSession && running && (
-            <button className="secondary-action" type="button" onClick={stopLive}>停止</button>
-          )}
-        </div>
-        <small>最大段数填 0 表示持续分析。低延迟模式会直接从直播流同时抓音频和关键帧；第一段是冷启动，后续段会复用转写和视觉会话。</small>
-      </form>
-      {liveError && (
-        <div className="error-line" role="alert">
-          <AlertCircle size={16} />
-          <span>{liveError}</span>
-        </div>
-      )}
-      {liveSession && (
-        <div className="live-session">
-          <div className="metric-row">
-            <span>{liveStatusLabel(liveSession.status)}</span>
-            <span>{liveSession.current_node}</span>
-            <span>{liveSession.segments.length} 段</span>
-          </div>
-          {liveSession.resolved_url && <p className="live-source">已解析流：{liveSession.resolved_url}</p>}
-          <div className="live-segments">
-            {liveSession.segments.length === 0 && <p className="empty">正在解析直播流并捕获第一个短窗口。</p>}
-            {liveSession.segments.map((segment) => (
-              <article className="live-segment" key={segment.index}>
-                {segment.frame?.url && <img src={segment.frame.url} alt={`live segment ${segment.index + 1}`} loading="lazy" />}
-                <div>
-                  <h3>{formatTime(segment.start_time)} - {formatTime(segment.end_time)}</h3>
-                  <p>{segment.summary}</p>
-                  {segment.transcript && <small>音频：{segment.transcript}</small>}
-                  <small>{liveLatencyText(segment)}</small>
-                </div>
-              </article>
-            ))}
-          </div>
-        </div>
-      )}
-    </section>
+    <div className="empty-stage">
+      {icon}
+      <strong>{title}</strong>
+      <span>{subtitle}</span>
+    </div>
   );
 }
 
-function ResultView({
-  result,
-  chat,
-  followup,
-  asking,
-  setFollowup,
-  askFollowup
-}: {
-  result: Result;
-  chat: ChatMessage[];
-  followup: string;
-  asking: boolean;
-  setFollowup: (value: string) => void;
-  askFollowup: (event: FormEvent) => void;
-}) {
-  const observedFrames = result.frames.filter((frame) => frame.observation);
-  const pendingFrames = result.frames.filter((frame) => !frame.observation);
-  const answerReady = Boolean(result.answer?.direct_answer);
-  const answerSections = buildAnswerSections(result.answer ?? null);
-
+function ThinkingMessage({ label }: { label: string }) {
   return (
-    <section className="result-grid">
-      <div className="answer-band">
-        <div className="section-title">
-          <CheckCircle2 size={18} />
-          <h2>{answerReady ? "最终回答" : "实时观察"}</h2>
-        </div>
-        {answerReady ? (
-          <>
-            <p className="direct-answer">{displayDirectAnswer(result.answer ?? null)}</p>
-            <div className="answer-sections">
-              {answerSections.map((section) => (
-                <section className="answer-section" key={section.title}>
-                  <h3>{section.title}</h3>
-                  <ul>
-                    {section.items.map((item, index) => (
-                      <li key={`${section.title}-${index}`}>{item}</li>
-                    ))}
-                  </ul>
-                </section>
-              ))}
-            </div>
-          </>
-        ) : (
-          <p className="empty">音频和关键画面正在进入分析链路，已完成的观察会先显示在下面。</p>
-        )}
-        <div className="metric-row">
-          <span>{result.metadata.duration_seconds ? formatTime(result.metadata.duration_seconds) : "--:--"} 视频时长</span>
-          <span>{result.transcript_segments?.length ?? 0} 段音频</span>
-          <span>{observedFrames.length}/{result.frames.length} 帧已观察</span>
-          {result.metadata.vision_provider && <span>{result.metadata.vision_provider}</span>}
-        </div>
-      </div>
-
-      <div className="timeline-band">
-        <div className="section-title">
-          <Activity size={18} />
-          <h2>音频时间线</h2>
-        </div>
-        {result.transcription_status && (
-          <div className="audio-status">
-            <strong>{transcriptionLabel(result.transcription_status.status)} / {result.transcription_status.method ?? "unknown"}</strong>
-            <span>{result.transcription_status.reason ?? "没有返回转写状态。"}</span>
-            {result.transcription_status.local_error && <small>{result.transcription_status.local_error}</small>}
-          </div>
-        )}
-        {Boolean(result.transcript_segments?.length) && (
-          <div className="transcript-list compact-scroll">
-            <div className="section-title compact">
-              <FileAudio size={16} />
-              <h3>音频转写</h3>
-            </div>
-            {result.transcript_segments?.slice(0, 18).map((segment, index) => (
-              <article className="transcript-row" key={`${segment.start}-${index}`}>
-                <span className="time">{formatTime(segment.start)}</span>
-                <p>{segment.text}</p>
-              </article>
-            ))}
-          </div>
-        )}
-        <div className="timeline">
-          {result.timeline.length === 0 && <p className="empty">没有可用音频时间线，已退化为稀疏视觉采样。</p>}
-          {result.timeline.map((event, index) => (
-            <article className="timeline-item" key={`${event.time}-${index}`}>
-              <span className="time">{formatTime(event.time)}</span>
-              <div>
-                <h3>{event.label}</h3>
-                <p>{event.evidence}</p>
-                {event.expected_visuals.length > 0 && <small>{event.expected_visuals.join(" / ")}</small>}
-              </div>
-            </article>
-          ))}
-        </div>
-      </div>
-
-      <div className="frames-band">
-        <div className="section-title">
-          <SearchCheck size={18} />
-          <h2>关键画面证据</h2>
-        </div>
-        <div className="frame-grid">
-          {result.frames.map((frame) => (
-            <article className="frame-card" key={frame.filename}>
-              <img src={frame.url} alt={`frame at ${formatTime(frame.time)}`} loading="lazy" />
-              <div>
-                <span className={frame.observation ? "evidence-pill observed" : "evidence-pill pending"}>
-                  {frame.observation ? "已观察" : "排队中"}
-                </span>
-                <h3>{formatTime(frame.time)}</h3>
-                <p className="target-text">{frame.observation?.visual_target ?? frame.probe?.question ?? frame.reason}</p>
-                <p>{frame.observation?.scene ?? frame.reason}</p>
-                {frame.observation?.evidence_assessment && <small>{frame.observation.evidence_assessment}</small>}
-              </div>
-            </article>
-          ))}
-        </div>
-        {pendingFrames.length > 0 && <p className="coverage-note">还有 {pendingFrames.length} 个关键画面正在等待观察。</p>}
-      </div>
-
-      <div className="coverage-band">
-        <div className="section-title">
-          <ImageIcon size={18} />
-          <h2>覆盖情况</h2>
-        </div>
-        <div className="coverage-list">
-          {coverageRows(result).map((row, index) => (
-            <article className="coverage-row" key={`${row.start}-${index}`}>
-              <span className="time">{row.start}{row.end ? `-${row.end}` : ""}</span>
-              <div>
-                <h3>{row.title}</h3>
-                <p>{row.text}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </div>
-
-      <div className="chat-band">
-        <div className="section-title">
-          <MessageSquareText size={18} />
-          <h2>继续追问</h2>
-        </div>
-        <div className="chat-list">
-          {chat.length === 0 && <p className="empty">分析完成前也可以先输入问题；回答会基于当前已有的音频和关键画面。</p>}
-          {chat.map((message, index) => (
-            <article className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
-              <p>{message.text}</p>
-              {Boolean(message.evidence?.length) && <small>{message.evidence?.join(" / ")}</small>}
-              {message.coverage && <small>{message.coverage}</small>}
-            </article>
-          ))}
-        </div>
-        <form className="followup-form" onSubmit={askFollowup}>
-          <input value={followup} onChange={(event) => setFollowup(event.target.value)} placeholder="继续问这个视频里的细节" />
-          <button type="submit" disabled={asking || !followup.trim()} aria-label="发送追问">
-            {asking ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-          </button>
-        </form>
-      </div>
-    </section>
+    <article className="chat-message assistant thinking-message" aria-live="polite">
+      <span>{label}</span>
+      <i />
+      <i />
+      <i />
+    </article>
   );
+}
+
+function LiveStage({ session }: { session: LiveSession }) {
+  const model = session.live_model;
+  const riskState = model?.risk_state;
+  const hasRisk = Boolean((riskState?.risk_segments ?? 0) > 0);
+  const latestFrame = session.segments[session.segments.length - 1]?.frame;
+  return (
+    <div className={`live-stage ${hasRisk ? "alert" : "clear"}`}>
+      {latestFrame?.url ? <img src={latestFrame.url} alt="直播风险截图" /> : <Radio size={34} />}
+      <div>
+        <strong>{hasRisk ? "发现风险" : liveStatusLabel(session.status)}</strong>
+        <span>{model?.stable_summary || "正在接入直播并扫描风险。"}</span>
+      </div>
+    </div>
+  );
+}
+
+function LiveModelMessage({ session }: { session: LiveSession }) {
+  const model = session.live_model;
+  if (!model) return null;
+  const riskState = model.risk_state;
+  const recentAlerts = riskState?.recent_alerts ?? [];
+  return (
+    <article className="chat-message assistant live-summary">
+      <p>{model.stable_summary || model.current_focus}</p>
+      <small>
+        已扫描 {riskState?.scanned_segments ?? model.segment_count} 个窗口；告警 {riskState?.risk_segments ?? 0} 次；最高风险 {riskLevelLabel(riskState?.highest_level)}。
+      </small>
+      {recentAlerts.slice(-3).map((alert, index) => (
+        <small key={`${alert.segment_index}-${index}`}>
+          {formatTime(alert.time ?? 0)}：{alert.summary || "风险告警"}
+        </small>
+      ))}
+    </article>
+  );
+}
+
+function statusText(job: Job | null, liveSession: LiveSession | null, mode: ComposerMode, pendingLive: PendingLive | null) {
+  if (liveSession) return liveStatusLabel(liveSession.status);
+  if (pendingLive) return "等待监控目标";
+  if (job?.status === "failed") return "分析失败";
+  if (job?.status === "succeeded") return "分析完成";
+  if (job) return labelForNode(job.current_node);
+  return mode === "live" ? "等待直播 URL" : "等待视频";
 }
 
 function labelForNode(node: string) {
@@ -822,128 +785,80 @@ function labelForNode(node: string) {
   return nodeLabels[node] ?? node;
 }
 
-function isActiveNode(current: string | undefined, node: string) {
-  if (!current) return false;
-  if (node === "observe_frames") return current.startsWith("observe_frames");
-  return current === node;
+function composerPlaceholder(mode: ComposerMode, hasVideoContext: boolean, hasPendingLive: boolean, hasLiveSession: boolean, pendingQuestionCount: number) {
+  if (mode === "live") {
+    if (hasPendingLive) return "输入要监控的内容，例如：粗口、擦边、抽烟、危险动作";
+    if (hasLiveSession) return "补充新的直播关注点";
+    return "粘贴直播 URL";
+  }
+  if (pendingQuestionCount > 0) return `已记下 ${pendingQuestionCount} 个问题，还可以继续补充`;
+  if (hasVideoContext) return "问这个视频一个问题，例如：详细总结一下升级点";
+  return "粘贴视频 URL，或点击上传本地视频";
 }
 
-function transcriptionLabel(status?: string) {
-  if (status === "ok") return "已识别";
-  if (status === "mock") return "模拟识别";
-  if (status === "empty") return "未识别到文本";
-  if (status === "skipped") return "未处理";
-  return status ?? "unknown";
+function isLikelyUrl(text: string) {
+  return /^https?:\/\//i.test(text.trim());
 }
 
 function liveStatusLabel(status: LiveStatus) {
   if (status === "queued") return "排队中";
   if (status === "running") return "运行中";
-  if (status === "streaming") return "实时输出中";
+  if (status === "streaming") return "监控中";
   if (status === "stopping") return "停止中";
   if (status === "stopped") return "已停止";
   if (status === "succeeded") return "已完成";
   return "失败";
 }
 
-function liveLatencyText(segment: LiveSegment) {
-  const parts = [];
-  if (segment.elapsed_seconds !== undefined) parts.push(`总 ${segment.elapsed_seconds}s`);
-  if (segment.capture?.capture_seconds !== undefined) parts.push(`捕获 ${segment.capture.capture_seconds}s`);
-  if (segment.transcript_seconds !== undefined) parts.push(`转写 ${segment.transcript_seconds}s`);
-  if (segment.vision_seconds !== undefined) parts.push(`视觉 ${segment.vision_seconds}s`);
-  if (segment.capture?.mode) parts.push(segment.capture.mode === "fast" ? "低延迟捕获" : "兼容捕获");
-  return parts.length ? parts.join(" / ") : "等待耗时统计";
+function riskLevelLabel(level?: string) {
+  if (level === "high") return "高";
+  if (level === "medium") return "中";
+  if (level === "low") return "低";
+  return "无";
 }
 
-function coverageRows(result: Result): CoverageRow[] {
-  const rows = result.prediction_checks.slice(0, 8).map((check) => ({
-    start: formatTime(check.window_start),
-    end: formatTime(check.window_end),
-    title: check.source_event || "片段覆盖",
-    text: check.evidence || check.hypothesis
-  }));
-  if (rows.length > 0) return rows;
-  return result.frames.slice(0, 8).map((frame) => ({
-    start: formatTime(frame.time),
-    title: frame.observation ? "已观察关键画面" : "计划观察关键画面",
-    text: frame.observation?.evidence_assessment || frame.observation?.scene || frame.reason
-  }));
+function thinkingLabel(asking: boolean, submitting: boolean, liveSubmitting: boolean, useWebSearch: boolean) {
+  if (asking) return useWebSearch ? "正在结合视频知识库和联网资料思考" : "正在基于视频知识库思考";
+  if (liveSubmitting) return "正在接入直播监控";
+  if (submitting) return "正在创建解析任务";
+  return "正在处理";
 }
 
-function buildAnswerSections(answer: Result["answer"]) {
-  if (!answer) return [];
-  if (answer.sections?.length) {
-    return answer.sections
-      .map((section) => ({
-        title: section.title,
-        items: section.items.map(cleanDisplayText).filter(Boolean)
-      }))
-      .filter((section) => section.items.length > 0);
+function renderTimeLinkedText(text: string, onSeek: (seconds: number) => void): ReactNode[] {
+  const parts: ReactNode[] = [];
+  const pattern = /(^|[^\d])(\d{1,2}:\d{2}(?::\d{2})?)(?!\d)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    const prefix = match[1];
+    const label = match[2];
+    const labelIndex = match.index + prefix.length;
+    if (labelIndex > lastIndex) parts.push(text.slice(lastIndex, labelIndex));
+    parts.push(
+      <button className="time-link" type="button" onClick={() => onSeek(secondsFromTimeLabel(label))} key={`${label}-${labelIndex}`}>
+        {label}
+      </button>
+    );
+    lastIndex = labelIndex + label.length;
   }
-
-  const summary = answer.summary ?? "";
-  const process = extractLabeledBlock(summary, "大致过程", ["关键画面证据", "覆盖说明", "结论"]);
-  const evidence = extractLabeledBlock(summary, "关键画面证据", ["覆盖说明", "结论"]);
-  const coverage = extractLabeledBlock(summary, "覆盖说明", ["结论"]);
-  const fallback = cleanDisplayText(summary);
-  const sections = [
-    { title: "过程脉络", items: splitChineseList(process).slice(0, 5) },
-    { title: "关键画面证据", items: splitChineseList(evidence).slice(0, 6) },
-    { title: "结论", items: splitChineseList(coverage || fallback).slice(0, 3) }
-  ].filter((section) => section.items.length > 0);
-  if (sections.length) return sections;
-  return [{ title: "摘要", items: [fallback].filter(Boolean) }];
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return parts.length ? parts : [text];
 }
 
-function displayDirectAnswer(answer: Result["answer"]) {
-  const raw = answer?.direct_answer ?? "";
-  const cleaned = cleanDisplayText(raw);
-  if (/3D|三地|打印|装修|家具|施工/.test(cleaned)) {
-    return "这是一个 3D 打印装修实验视频，主线是用 3D 打印参与整屋装修和家具制作，并观察它在设计、施工、成本和成品效果上的表现。";
-  }
-  if (/不确|核心线索是：.*；.*；/.test(cleaned)) {
-    return cleaned.split(" 核心线索是：")[0] || "视频已完成音频和关键画面分析。";
-  }
-  return cleaned;
+function secondsFromTimeLabel(label: string) {
+  const parts = label.split(":").map((part) => Number(part));
+  if (parts.some((part) => Number.isNaN(part))) return 0;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return parts[0] * 60 + parts[1];
 }
 
-function extractLabeledBlock(text: string, label: string, nextLabels: string[]) {
-  const startToken = `${label}：`;
-  const start = text.indexOf(startToken);
-  if (start < 0) return "";
-  let end = text.length;
-  for (const next of nextLabels) {
-    const index = text.indexOf(`${next}：`, start + startToken.length);
-    if (index >= 0 && index < end) end = index;
-  }
-  return text.slice(start + startToken.length, end).trim();
-}
-
-function splitChineseList(text: string) {
-  const cleaned = cleanDisplayText(text);
-  if (!cleaned) return [];
-  return cleaned
-    .split(/[；;]\s*/)
-    .map(cleanDisplayText)
-    .filter((item) => item.length > 0 && item !== "。" && !isDisplayNoise(item))
-    .slice(0, 8);
-}
-
-function isDisplayNoise(text: string) {
-  const compact = text.replace(/\s+/g, "");
-  if (["不确", "不确定"].includes(compact)) return true;
-  return /无法支持|不能支持|不支持|未见|看不到|没有3D打印设备|没有 3D 打印设备/.test(text);
-}
-
-function cleanDisplayText(text: string) {
-  return text
-    .replace(/\s+/g, " ")
-    .replace(/\.{3,}/g, "...")
-    .replace(/。。+/g, "。")
-    .replace(/；。/g, "。")
-    .trim()
-    .replace(/^[。；,，\s]+|[；,，\s]+$/g, "");
+function formatTime(seconds: number) {
+  const safe = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const rest = safe % 60;
+  if (hours > 0) return `${hours}:${minutes.toString().padStart(2, "0")}:${rest.toString().padStart(2, "0")}`;
+  return `${minutes}:${rest.toString().padStart(2, "0")}`;
 }
 
 function mergePartialResult(current: Result | null, next: Result) {
@@ -970,13 +885,4 @@ function errorMessage(err: unknown, fallback: string) {
   } catch {
     return err.message || fallback;
   }
-}
-
-function formatTime(seconds: number) {
-  const safe = Math.max(0, Math.round(seconds));
-  const hours = Math.floor(safe / 3600);
-  const minutes = Math.floor((safe % 3600) / 60);
-  const rest = safe % 60;
-  if (hours > 0) return `${hours}:${minutes.toString().padStart(2, "0")}:${rest.toString().padStart(2, "0")}`;
-  return `${minutes}:${rest.toString().padStart(2, "0")}`;
 }

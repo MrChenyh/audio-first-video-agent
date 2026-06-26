@@ -144,14 +144,8 @@ class VideoProcessor:
         return float(value or 0)
 
     def validate_duration(self, duration: float) -> None:
-        if duration < self.settings.min_video_seconds:
-            raise ValueError(
-                f"Video is too short for v1 ({duration:.1f}s). Minimum is {self.settings.min_video_seconds:.0f}s."
-            )
-        if duration > self.settings.max_video_seconds:
-            raise ValueError(
-                f"Video is too long for v1 ({duration:.1f}s). Maximum is {self.settings.max_video_seconds:.0f}s."
-            )
+        if duration <= 0:
+            raise ValueError("Video duration could not be read.")
 
     def extract_audio(self, video_path: Path, output_path: Path, has_audio: bool) -> Path | None:
         if not has_audio:
@@ -235,6 +229,37 @@ class VideoProcessor:
             if fallback_path.exists():
                 fallback_path.unlink(missing_ok=True)
             raise RuntimeError(f"ffmpeg frame extraction failed: {completed.stderr.strip()}")
+
+    def extract_clip(self, video_path: Path, start_seconds: float, duration_seconds: float, output_path: Path, width: int = 640) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        ffmpeg = self.ffmpeg
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg was not found. Install FFmpeg or set FFMPEG_PATH.")
+        command = [
+            ffmpeg,
+            "-y",
+            "-ss",
+            f"{max(0.0, start_seconds):.2f}",
+            "-i",
+            str(video_path),
+            "-t",
+            f"{max(0.1, duration_seconds):.2f}",
+            "-an",
+            "-vf",
+            f"scale={width}:-2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        completed = self._run_media_command(command)
+        if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError(f"ffmpeg clip extraction failed: {completed.stderr.strip()}")
 
     def extract_analysis_frame(self, video_path: Path, time_seconds: float, output_path: Path, size: int = 96) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)

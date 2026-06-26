@@ -36,8 +36,22 @@ class Settings:
     joyai_api_key: str
     joyai_model: str
     joyai_timeout_seconds: float
+    joyai_input_mode: str
+    joyai_clip_seconds: float
+    joyai_adaptive_clip_seconds: bool
+    joyai_clip_width: int
+    joyai_max_clips_per_job: int
     reasoning_model: str
     reasoning_effort: str | None
+    followup_model: str | None
+    followup_timeout_seconds: float
+    followup_max_chunks: int
+    web_search_enabled: bool
+    web_search_provider: str
+    web_search_base_url: str | None
+    web_search_api_key: str | None
+    web_search_timeout_seconds: float
+    web_search_max_results: int
     min_video_seconds: float
     max_video_seconds: float
     max_refinement_rounds: int
@@ -104,10 +118,24 @@ def load_settings() -> Settings:
         joyai_api_key=os.getenv("JOYAI_API_KEY", "EMPTY"),
         joyai_model=os.getenv("JOYAI_MODEL", "JoyAI-VL-Interaction-Preview"),
         joyai_timeout_seconds=float(os.getenv("JOYAI_TIMEOUT_SECONDS", "30")),
+        joyai_input_mode=os.getenv("JOYAI_INPUT_MODE", "clips").strip().lower(),
+        joyai_clip_seconds=max(1.0, float(os.getenv("JOYAI_CLIP_SECONDS", "4"))),
+        joyai_adaptive_clip_seconds=_bool_env(os.getenv("JOYAI_ADAPTIVE_CLIP_SECONDS"), True),
+        joyai_clip_width=max(160, int(os.getenv("JOYAI_CLIP_WIDTH", "640"))),
+        joyai_max_clips_per_job=max(0, int(os.getenv("JOYAI_MAX_CLIPS_PER_JOB", "4"))),
         reasoning_model=os.getenv("REASONING_MODEL", "gpt-5.5"),
         reasoning_effort=os.getenv("REASONING_EFFORT") or None,
-        min_video_seconds=float(os.getenv("MIN_VIDEO_SECONDS", "30")),
-        max_video_seconds=float(os.getenv("MAX_VIDEO_SECONDS", "600")),
+        followup_model=os.getenv("FOLLOWUP_MODEL") or None,
+        followup_timeout_seconds=max(5.0, float(os.getenv("FOLLOWUP_TIMEOUT_SECONDS", "20"))),
+        followup_max_chunks=max(4, int(os.getenv("FOLLOWUP_MAX_CHUNKS", "12"))),
+        web_search_enabled=_bool_env(os.getenv("WEB_SEARCH_ENABLED"), True),
+        web_search_provider=os.getenv("WEB_SEARCH_PROVIDER", "duckduckgo").strip().lower(),
+        web_search_base_url=os.getenv("WEB_SEARCH_BASE_URL") or None,
+        web_search_api_key=os.getenv("WEB_SEARCH_API_KEY") or None,
+        web_search_timeout_seconds=max(2.0, float(os.getenv("WEB_SEARCH_TIMEOUT_SECONDS", "8"))),
+        web_search_max_results=max(1, int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))),
+        min_video_seconds=float(os.getenv("MIN_VIDEO_SECONDS", "0")),
+        max_video_seconds=float(os.getenv("MAX_VIDEO_SECONDS", "0")),
         max_refinement_rounds=int(os.getenv("MAX_REFINEMENT_ROUNDS", "1")),
         max_keyframes=int(os.getenv("MAX_KEYFRAMES", "8")),
         enhanced_initial_keyframes=max(1, int(os.getenv("ENHANCED_INITIAL_KEYFRAMES", "4"))),
