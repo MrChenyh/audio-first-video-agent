@@ -54,7 +54,6 @@ button {
 .media-footer,
 .brand-lockup,
 .mode-switch,
-.ask-tabs,
 .quick-actions,
 .quick-actions button,
 .composer-row,
@@ -112,7 +111,6 @@ button {
 }
 
 .mode-switch button,
-.ask-tabs button,
 .quick-actions button,
 .suggested-questions button {
   border: 0;
@@ -137,8 +135,10 @@ button {
 .player-shell {
   display: grid;
   min-height: 0;
-  place-items: center;
+  align-items: center;
+  justify-items: center;
   overflow: hidden;
+  padding-bottom: 8px;
   background: #030406;
 }
 
@@ -151,7 +151,7 @@ button {
 }
 
 .source-video {
-  max-height: 100%;
+  max-height: calc(100% - 8px);
   background: #030406;
 }
 
@@ -258,48 +258,18 @@ button {
 
 .ask-panel {
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   background: #191b24;
   color: #eef1f6;
 }
 
-.ask-tabs {
-  min-height: 54px;
-  gap: 22px;
-  padding: 0 18px;
-  border-bottom: 1px solid #282b36;
-}
-
-.ask-tabs button {
-  position: relative;
-  height: 54px;
-  padding: 0;
-  background: transparent;
-  color: #8f97a5;
-  font-weight: 760;
-}
-
-.ask-tabs button.active {
-  color: #f4f7fb;
-}
-
-.ask-tabs button.active::after {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 2px;
-  border-radius: 99px;
-  background: #2c8dff;
-  content: "";
-}
-
 .quick-actions {
   flex-wrap: wrap;
   gap: 8px;
-  padding: 12px 16px 8px;
+  padding: 14px 16px 8px;
+  border-bottom: 1px solid #282b36;
 }
 
 .quick-actions button {
@@ -354,13 +324,14 @@ button {
 }
 
 .chat-list {
-  display: grid;
-  align-content: start;
-  gap: 12px;
   min-height: 0;
   overflow: auto;
-  padding: 12px 16px 18px;
+  padding: 14px 16px 22px;
   scrollbar-color: #434856 transparent;
+}
+
+.chat-list > * + * {
+  margin-top: 12px;
 }
 
 .chat-message {
@@ -401,12 +372,12 @@ button {
 .overview-message {
   width: 100%;
   padding: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .overview-card {
   display: grid;
-  gap: 13px;
+  gap: 14px;
 }
 
 .overview-title {
@@ -424,7 +395,21 @@ button {
   color: #ffffff;
 }
 
+.overview-section {
+  display: grid;
+  gap: 8px;
+}
+
+.overview-section h2 {
+  margin: 0;
+  color: #ffffff;
+  font-size: 0.92rem;
+  font-weight: 820;
+  letter-spacing: 0;
+}
+
 .overview-card p {
+  margin: 0;
   color: #f1f3f7;
 }
 
@@ -443,13 +428,6 @@ button {
 .highlights {
   display: grid;
   gap: 7px;
-}
-
-.highlights h2 {
-  margin: 2px 0 3px;
-  color: #f4f6fb;
-  font-size: 0.95rem;
-  letter-spacing: 0;
 }
 
 .highlight-row {
@@ -479,11 +457,9 @@ button {
 }
 
 .highlight-row strong {
-  overflow: hidden;
   color: #eef2f8;
   font-size: 0.88rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
 }
 
 .highlight-row small {
@@ -512,13 +488,14 @@ button {
 
 .suggested-questions button {
   justify-content: flex-start;
-  min-height: 36px;
+  min-height: 34px;
   gap: 7px;
-  padding: 0;
+  padding: 2px 0;
   background: transparent;
   color: #a9d1ff;
   font-size: 0.88rem;
   font-weight: 720;
+  line-height: 1.45;
   text-align: left;
 }
 
@@ -710,10 +687,6 @@ button {
 
   .mini-progress > span {
     text-align: left;
-  }
-
-  .ask-tabs {
-    gap: 18px;
   }
 
   .quick-actions {

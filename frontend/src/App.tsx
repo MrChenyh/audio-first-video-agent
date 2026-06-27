@@ -687,12 +687,6 @@ export function App() {
       </section>
 
       <aside className="ask-panel">
-        <header className="ask-tabs">
-          <button type="button">详情</button>
-          <button type="button">评论</button>
-          <button type="button" className="active">问AI</button>
-        </header>
-
         <div className="quick-actions">
           <button type="button" onClick={() => fileInputRef.current?.click()} disabled={submitting || liveSubmitting}>
             <UploadCloud size={16} /> 上传本地视频
@@ -782,14 +776,20 @@ function OverviewCard({ overview, onSeek, onAsk }: { overview: AiOverview; onSee
         <span><Sparkles size={15} /></span>
         <strong>总结当前视频内容</strong>
       </div>
-      <p>{renderTimeLinkedText(overview.summary, onSeek)}</p>
+      <section className="overview-section">
+        <h2>内容概览</h2>
+        <p>{renderTimeLinkedText(overview.summary, onSeek)}</p>
+      </section>
       {bullets.length > 0 && (
-        <ul className="overview-bullets">
-          {bullets.map((item) => <li key={item}>{renderTimeLinkedText(item, onSeek)}</li>)}
-        </ul>
+        <section className="overview-section">
+          <h2>关键要点</h2>
+          <ul className="overview-bullets">
+            {bullets.map((item) => <li key={item}>{renderTimeLinkedText(item, onSeek)}</li>)}
+          </ul>
+        </section>
       )}
       {highlights.length > 0 && (
-        <div className="highlights">
+        <section className="highlights overview-section">
           <h2>高光片段</h2>
           {highlights.map((item) => (
             <button type="button" className="highlight-row" key={`${item.time}-${item.label}`} onClick={() => onSeek(item.time)}>
@@ -800,16 +800,17 @@ function OverviewCard({ overview, onSeek, onAsk }: { overview: AiOverview; onSee
               </span>
             </button>
           ))}
-        </div>
+        </section>
       )}
       {questions.length > 0 && (
-        <div className="suggested-questions">
+        <section className="suggested-questions overview-section">
+          <h2>你可以继续问</h2>
           {questions.map((question) => (
             <button type="button" key={question} onClick={() => onAsk(question)}>
               <Sparkles size={13} /> {question}
             </button>
           ))}
-        </div>
+        </section>
       )}
       <small className="overview-note">以上总结由本地视频解析结果生成，时间点可点击跳转。</small>
     </div>
