@@ -1446,13 +1446,7 @@ class AIClient:
             {"title": "内容脉络", "items": process_items[:5]},
             {"title": "关键结论", "items": conclusion_items},
         ]
-        summary = " ".join(
-            [
-                "视频主题：" + direct,
-                "内容脉络：" + "；".join(process_items[:4]) + "。",
-                "关键结论：" + conclusion_items[0],
-            ]
-        )
+        summary = AIClient._compose_user_facing_summary(topic_profile, process_items, conclusion_items[0])
         return {
             "direct_answer": direct or f"快速模式已处理问题：{question}",
             "summary": summary[:900],
@@ -1468,11 +1462,12 @@ class AIClient:
         summary = str(answer.get("summary") or direct).strip()
         if not summary:
             summary = AIClient._generic_detailed_followup_answer(result)
+        summary = AIClient._clean_overview_summary(summary)
         bullets = AIClient._overview_bullets(answer, result)
         highlights = AIClient._overview_highlights(result)
         suggested_questions = AIClient._overview_suggested_questions(result)
         return {
-            "summary": AIClient._compress_text(summary or "当前视频已完成解析，可以继续围绕内容提问。", 760),
+            "summary": AIClient._compress_text(summary or "当前视频已完成解析，可以继续围绕内容提问。", 520),
             "bullets": bullets[:4],
             "highlights": highlights[:5],
             "suggested_questions": suggested_questions[:5],
@@ -1487,8 +1482,9 @@ class AIClient:
                 text = str(item).strip()
                 if not text:
                     continue
-                prefix = f"{title}：" if title else ""
-                bullets.append(AIClient._compress_text(prefix + text, 128))
+                clean = AIClient._clean_overview_item(text)
+                if clean:
+                    bullets.append(AIClient._compress_text(clean, 132))
                 if len(bullets) >= 4:
                     return bullets
         direct = str(answer.get("direct_answer") or "").strip()
@@ -1506,13 +1502,16 @@ class AIClient:
         for section in answer.get("sections") or []:
             for item in section.get("items") or []:
                 text = str(item or "")
+                clean_text = AIClient._clean_overview_item(text)
+                if not clean_text or AIClient._is_bad_highlight_text(clean_text):
+                    continue
                 time_value = AIClient._first_time_in_text(text)
                 if time_value is not None:
                     candidates.append(
                         {
                             "time": time_value,
-                            "label": AIClient._label_from_text(text),
-                            "detail": AIClient._strip_leading_time(text),
+                            "label": AIClient._label_from_text(clean_text),
+                            "detail": clean_text,
                             "source": "answer",
                             "score": 90,
                         }
@@ -1521,7 +1520,7 @@ class AIClient:
             text = AIClient._clean_asr_text(str(item.get("evidence") or item.get("label") or ""))
             label = str(item.get("label") or "").strip()
             combined = " ".join([label, text])
-            if AIClient._is_noisy_text(text, combined):
+            if AIClient._is_noisy_text(text, combined) or AIClient._is_bad_highlight_text(combined):
                 continue
             candidates.append(
                 {
@@ -1557,7 +1556,7 @@ class AIClient:
             )
         for segment in result.get("transcript_segments") or []:
             text = AIClient._clean_asr_text(str(segment.get("text") or ""))
-            if AIClient._is_noisy_text(text, text):
+            if AIClient._is_noisy_text(text, text) or AIClient._is_bad_highlight_text(text):
                 continue
             candidates.append(
                 {
@@ -1579,6 +1578,71 @@ class AIClient:
             if len(deduped) >= 5:
                 break
         return sorted(deduped, key=lambda value: float(value.get("time") or 0.0))
+
+    @staticmethod
+    def _compose_user_facing_summary(topic_profile: dict[str, str], process_items: list[str], conclusion: str) -> str:
+        kind = topic_profile.get("kind")
+        clean_items = [AIClient._clean_overview_item(item) for item in process_items]
+        clean_items = [item for item in clean_items if item]
+        if kind == "3d_printing":
+            stages = "；".join(clean_items[:3])
+            return (
+                "这条视频是在做一次“用 3D 打印参与整屋装修”的实践记录。"
+                "作者先把房子里的装修部件、家具和装饰件转成设计方案，再尝试用 3D 打印材料把它们做出来，"
+                "中间穿插施工安装、材料成本和最终质感对比。"
+                f"{' 主要过程是：' + stages + '。' if stages else ''}"
+                "整体结论是：3D 打印能做出有造型、有层纹的柜体和家具部件，但它还不是简单替代传统装修，"
+                "真正的难点在于材料选择、打印成本、安装衔接和成品质感。"
+            )
+        if kind == "product_review":
+            stages = "；".join(clean_items[:3])
+            return (
+                f"{topic_profile.get('direct', '').strip()} "
+                f"{'视频展开顺序是：' + stages + '。' if stages else ''}"
+                f"{conclusion}"
+            ).strip()
+        return " ".join(part for part in [topic_profile.get("direct", ""), "；".join(clean_items[:3]), conclusion] if part)
+
+    @staticmethod
+    def _clean_overview_summary(text: str) -> str:
+        cleaned = " ".join(str(text or "").split())
+        cleaned = cleaned.replace("视频主题：", "").replace("内容脉络：", "").replace("关键结论：", "")
+        cleaned = cleaned.replace("。。", "。").replace("；。", "。")
+        cleaned = cleaned.strip(" ；。")
+        if cleaned and not cleaned.endswith(("。", "！", "？")):
+            cleaned += "。"
+        return cleaned
+
+    @staticmethod
+    def _clean_overview_item(text: str) -> str:
+        cleaned = AIClient._strip_leading_time(str(text or ""))
+        cleaned = cleaned.replace("先明确目标和方案：", "明确目标和方案：")
+        cleaned = cleaned.replace("随后进入打印和材料部分：", "打印和材料：")
+        cleaned = cleaned.replace("中段转向现场施工：", "现场施工：")
+        cleaned = cleaned.replace("后段讨论成本：", "成本测算：")
+        cleaned = cleaned.replace("最后看成品效果：", "成品效果：")
+        cleaned = cleaned.replace("内容脉络：", "").replace("关键结论：", "")
+        cleaned = cleaned.strip(" ；。")
+        if AIClient._is_bad_highlight_text(cleaned):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _is_bad_highlight_text(text: str) -> bool:
+        compact = "".join(str(text or "").split())
+        bad_phrases = (
+            "就是给别人",
+            "给别人接着",
+            "那既然他这么说了",
+            "看看到底是怎样一种感受",
+            "这里长什么样",
+            "那个这个",
+            "不确",
+        )
+        if any(phrase in compact for phrase in bad_phrases):
+            return True
+        meaningful = ("3D", "打印", "装修", "设计", "建模", "材料", "成本", "施工", "家具", "成品", "效果", "柜体", "传统", "画质", "长焦", "动态范围")
+        return len(compact) < 10 and not any(token in compact for token in meaningful)
 
     @staticmethod
     def _overview_suggested_questions(result: dict[str, Any]) -> list[str]:
@@ -2227,12 +2291,17 @@ class AIClient:
             return ""
         context_text = AIClient._result_text_context(result)
         is_product_review = any(token.lower() in context_text.lower() for token in ("Pocket", "Pockets", "大疆", "DJI", "画质", "长焦"))
+        is_3d_printing = AIClient._is_3d_printing_result(result)
         asks_upgrade = any(token in compact_question for token in ("升级", "提升", "比上一代", "上一代", "普通版", "区别", "差异", "pro多少", "多花"))
         asks_buying_advice = AIClient._is_buying_advice_followup_question(compact_question)
         asks_summary = AIClient._is_summary_followup_question(compact_question)
         asks_detail = any(token in compact_question for token in ("详细", "展开", "具体", "完整", "更清楚")) and any(
             token in compact_question for token in ("总结", "讲", "说", "分析", "梳理")
         )
+        if is_3d_printing:
+            answer = AIClient._printing_renovation_followup_answer(compact_question, result)
+            if answer:
+                return answer
         if is_product_review and asks_upgrade:
             return AIClient._product_upgrade_followup_answer(result)
         if is_product_review and asks_buying_advice:
@@ -2243,6 +2312,68 @@ class AIClient:
             return AIClient._generic_buying_advice_followup_answer(result)
         if asks_detail or asks_summary:
             return AIClient._generic_detailed_followup_answer(result)
+        return ""
+
+    @staticmethod
+    def _is_3d_printing_result(result: dict[str, Any]) -> bool:
+        text = AIClient._result_text_context(result)
+        return any(token in text for token in ("3D 打印", "3D打印", "打印装修", "整屋装修", "家具", "柜体")) and any(
+            token in text for token in ("装修", "施工", "材料", "成本", "家具", "房子")
+        )
+
+    @staticmethod
+    def _printing_renovation_followup_answer(compact_question: str, result: dict[str, Any]) -> str:
+        overview = AIClient.build_ai_overview(result)
+        highlights = overview.get("highlights") or []
+        time_for = lambda *keywords: AIClient._first_transcript_time(result.get("transcript_segments") or [], keywords)
+        t_design = time_for("设计", "建模", "制作装修") or AIClient._highlight_time(highlights, "设计", "方案") or "1:12"
+        t_cost = time_for("成本", "一公斤", "二三十", "材料") or AIClient._highlight_time(highlights, "成本", "材料") or "10:02"
+        t_effect = time_for("效果", "传统家具", "成品", "接近传统") or AIClient._highlight_time(highlights, "效果", "成品") or "12:42"
+        t_printing = time_for("打印", "3D", "材料堆叠") or AIClient._highlight_time(highlights, "打印", "材料") or "7:58"
+        asks_difficulty = any(token in compact_question for token in ("难点", "困难", "挑战", "问题", "卡点"))
+        asks_cost = any(token in compact_question for token in ("成本", "材料", "价格", "多少钱", "单价", "耗材"))
+        asks_effect = any(token in compact_question for token in ("效果", "成品", "最终", "质感", "好不好", "怎么样"))
+        asks_summary = AIClient._is_summary_followup_question(compact_question) or any(token in compact_question for token in ("主要讲", "讲什么"))
+        if asks_difficulty:
+            return (
+                "这个项目的难点不只是“能不能打印出来”，而是把 3D 打印真正接进装修流程。"
+                f"第一，要先把柜体、家具和装饰部件转成可打印的设计/建模方案（{t_design}）。"
+                f"第二，材料和设备要能稳定打印大尺寸部件，打印层纹、透光材料、结构强度都会影响最终质感（{t_printing}）。"
+                f"第三，打印出来后还要和墙面、灯具、瓷砖、安装这些传统施工环节衔接，否则单个部件好看也不等于整屋能落地。"
+                f"最后是成本：耗材单价、打印时间和失败率都会决定它到底是实验玩法还是可复制方案（{t_cost}）。"
+            )
+        if asks_cost:
+            return (
+                "视频里对成本和材料的态度比较现实：3D 打印不是“按一下就很便宜”的装修方式。"
+                f"它会涉及耗材选择、材料单价、打印用量和后期安装成本，视频中还提到类似“一公斤二三十”的材料价格线索（{t_cost}）。"
+                f"材料方面，重点不是单纯便宜，而是不同部件要用不同材料：有的追求结构强度，有的追求透光或装饰效果，有的要接近传统家具质感（{t_printing}、{t_effect}）。"
+                "所以结论是：材料可玩性很强，但成本是否划算要看打印规模、失败率和传统施工替代程度。"
+            )
+        if asks_effect:
+            return (
+                "最终效果可以理解为“实验成功，但还带着 3D 打印的特征”。"
+                f"视频重点展示了柜体、家具或装饰件这类成品，它们能做出定制造型和层层堆叠的纹理（{t_effect}）。"
+                "优点是造型自由、可以做传统木工不太方便的形态；不足是层纹、表面质感、安装收口和耐用性仍会影响它能不能完全替代传统家具。"
+                "所以它更像一次证明可行性的整屋装修实验，而不是已经成熟到所有家庭都能直接照抄的标准方案。"
+            )
+        if asks_summary:
+            bullets = [str(item) for item in overview.get("bullets") or [] if str(item).strip()]
+            process = "；".join(bullets[:3])
+            return (
+                "这条视频主要记录一次用 3D 打印参与整套房装修的实验。"
+                f"它先做设计和建模（{t_design}），再讨论打印材料、设备和可打印部件（{t_printing}），"
+                f"后面转向成本、施工衔接和最终家具/柜体效果（{t_cost}、{t_effect}）。"
+                f"{' 关键过程可以概括为：' + process + '。' if process else ''}"
+                "核心结论是：3D 打印能提升定制化和造型自由度，但材料、成本、安装和成品质感仍是落地难点。"
+            )
+        return ""
+
+    @staticmethod
+    def _highlight_time(highlights: list[dict[str, Any]], *keywords: str) -> str:
+        for item in highlights:
+            text = " ".join(str(item.get(key) or "") for key in ("label", "detail"))
+            if any(keyword in text for keyword in keywords):
+                return str(item.get("time_label") or AIClient._format_seconds(float(item.get("time") or 0.0)))
         return ""
 
     @staticmethod

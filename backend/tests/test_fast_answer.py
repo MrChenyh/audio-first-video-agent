@@ -45,6 +45,42 @@ def test_fast_answer_structures_long_video_summary_and_filters_noise():
     assert answer["evidence_refs"] == []
 
 
+def test_ai_overview_for_3d_printing_is_readable_and_filters_noisy_highlights():
+    result = _printing_renovation_result()
+
+    overview = AIClient.build_ai_overview(result)
+
+    assert "视频主题" not in overview["summary"]
+    assert "内容脉络：" not in overview["summary"]
+    assert "3D 打印" in overview["summary"]
+    assert overview["summary"].endswith("。")
+    assert overview["bullets"]
+    assert all(not item.startswith("内容脉络") for item in overview["bullets"])
+    highlight_text = " ".join(f"{item.get('label', '')} {item.get('detail', '')}" for item in overview["highlights"])
+    assert "就是给别人" not in highlight_text
+    assert "不确" not in highlight_text
+    assert any("成本" in item.get("label", "") or "成本" in item.get("detail", "") for item in overview["highlights"])
+
+
+def test_3d_printing_followups_answer_specific_questions_without_asr_fragments():
+    result = _printing_renovation_result()
+
+    difficulty = AIClient._local_followup_answer("这个项目的主要难点是什么？", result)["answer"]
+    cost = AIClient._local_followup_answer("成本和材料是怎么说的？", result)["answer"]
+    effect = AIClient._local_followup_answer("最终效果怎么样？", result)["answer"]
+
+    assert "材料" in difficulty
+    assert "施工" in difficulty
+    assert "成本" in difficulty
+    assert "一公斤" in cost
+    assert "耗材" in cost
+    assert "传统家具" in effect or "层层堆叠" in effect
+    joined = " ".join([difficulty, cost, effect])
+    assert "就是给别人" not in joined
+    assert "看看到底" not in joined
+    assert "这个追问没有" not in joined
+
+
 def test_fast_answer_summarizes_product_review_instead_of_evidence_dump():
     timeline = [
         {"time": 0.14, "label": "音频事件 1", "evidence": "当你点开这个视频说明你一定考虑过这个问题"},
@@ -232,5 +268,32 @@ def _pocket_review_result():
             {"start": 709.90, "end": 711.50, "text": "别的东西跟Pocket 4真的一样"},
         ],
         "timeline": [],
+        "frames": [],
+    }
+
+
+def _printing_renovation_result():
+    timeline = [
+        {"time": 31, "label": "成品效果线索", "evidence": "最后看成品效果：重点是柜体、家具或房间细节能否接近传统装修和家具的质感。"},
+        {"time": 72, "label": "设计建模线索", "evidence": "先明确目标和方案：尝试用 3D 打印参与整屋装修/部件制作，并进行设计建模。"},
+        {"time": 439, "label": "音频事件 5", "evidence": "就是给别人接着跳这个"},
+        {"time": 478, "label": "3D 打印过程线索", "evidence": "随后进入打印和材料部分：关注打印设备、材料堆叠成型，以及可打印哪些装修/家具部件。"},
+        {"time": 602, "label": "成本线索", "evidence": "后段讨论成本：包括材料单价、用量、整体预算，以及这种方案是否划算。"},
+        {"time": 616, "label": "材料价格线索", "evidence": "一公斤也得二三十"},
+        {"time": 762, "label": "成品效果线索", "evidence": "就能实现一个无限接近传统家具的效果"},
+    ]
+    answer = AIClient._fast_answer("总结当前视频内容", {"timeline": timeline}, [], [])
+    return {
+        "answer": answer,
+        "audio_world_model": {"summary": "3D 打印装修实验，讨论设计、材料、成本和最终效果。"},
+        "timeline": timeline,
+        "transcript_segments": [
+            {"start": 72, "end": 76, "text": "进行所有的设计 制作装修"},
+            {"start": 478, "end": 482, "text": "打印材料层层堆叠"},
+            {"start": 602, "end": 606, "text": "成本是三地打印装修"},
+            {"start": 616, "end": 620, "text": "一公斤也得二三十"},
+            {"start": 762, "end": 768, "text": "就能实现一个无限接近传统家具的效果"},
+            {"start": 439, "end": 443, "text": "就是给别人接着跳这个"},
+        ],
         "frames": [],
     }
