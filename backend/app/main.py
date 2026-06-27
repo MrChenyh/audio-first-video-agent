@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
@@ -28,7 +29,14 @@ store = JobStore(settings.data_dir)
 runner = JobRunner(settings, store)
 live_manager = LiveSessionManager(settings, store)
 
-app = FastAPI(title="Audio-First Video Understanding Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    store.init()
+    yield
+
+
+app = FastAPI(title="Audio-First Video Understanding Agent", lifespan=lifespan)
 
 
 class UrlJobRequest(BaseModel):
@@ -54,11 +62,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup() -> None:
-    store.init()
 
 
 @app.get("/api/health")
