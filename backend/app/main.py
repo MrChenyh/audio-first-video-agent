@@ -299,7 +299,7 @@ def _state_to_partial(job: dict[str, object], state: dict[str, object]) -> dict[
 
     audio_world_model = state.get("audio_world_model", {}) if isinstance(state, dict) else {}
     timeline = audio_world_model.get("timeline", []) if isinstance(audio_world_model, dict) else []
-    return {
+    partial = {
         "job_id": job.get("job_id"),
         "question": job.get("question"),
         "partial": True,
@@ -326,6 +326,8 @@ def _state_to_partial(job: dict[str, object], state: dict[str, object]) -> dict[
         },
         "transcription_status": state.get("transcription_status", {}) or {},
     }
+    partial["ai_overview"] = AIClient.build_ai_overview(partial)
+    return partial
 
 
 def _augment_result_for_followup(

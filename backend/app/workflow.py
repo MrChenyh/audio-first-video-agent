@@ -356,4 +356,5 @@ class VideoUnderstandingWorkflow:
             },
             "transcription_status": state.get("transcription_status", {}),
         }
+        result["ai_overview"] = AIClient.build_ai_overview(result)
         return {"answer": answer, "result": result}

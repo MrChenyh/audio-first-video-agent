@@ -1,11 +1,13 @@
 import {
   Activity,
   AlertCircle,
+  Bot,
   Globe2,
   Loader2,
   Play,
   Radio,
   Send,
+  Sparkles,
   Square,
   UploadCloud,
   Video
@@ -26,6 +28,23 @@ type Job = {
   error?: string | null;
 };
 
+type AiHighlight = {
+  time: number;
+  time_label?: string;
+  label: string;
+  detail?: string;
+  source?: string;
+  url?: string;
+  filename?: string;
+};
+
+type AiOverview = {
+  summary: string;
+  bullets?: string[];
+  highlights?: AiHighlight[];
+  suggested_questions?: string[];
+};
+
 type Result = {
   job_id?: string;
   question: string;
@@ -40,6 +59,7 @@ type Result = {
     uncertainties: string[];
     sections?: Array<{ title: string; items: string[] }>;
   } | null;
+  ai_overview?: AiOverview;
   timeline: Array<{
     time: number;
     end_time?: number | null;
@@ -64,6 +84,7 @@ type Result = {
     observation?: {
       scene?: string;
       evidence_assessment?: string;
+      visible_text?: string[];
       notes?: string;
     } | null;
   }>;
@@ -113,10 +134,6 @@ type LiveSegment = {
   end_time: number;
   transcript?: string;
   summary: string;
-  elapsed_seconds?: number;
-  transcript_seconds?: number;
-  vision_seconds?: number;
-  analysis_seconds?: number;
   frame?: {
     time: number;
     filename: string;
@@ -173,8 +190,10 @@ type LiveSession = {
 
 type ChatMessage = {
   role: "user" | "assistant" | "system";
-  text: string;
+  kind?: "text" | "overview";
+  text?: string;
   meta?: string;
+  overview?: AiOverview;
 };
 
 type PendingLive = {
@@ -186,7 +205,7 @@ type PendingVideoQuestion = {
   useWebSearch: boolean;
 };
 
-const PREPARE_VIDEO_QUESTION = "用户稍后会在对话中提问；请先解析视频内容，准备支持问答。";
+const PREPARE_VIDEO_QUESTION = "默认总结当前视频内容，并准备支持用户后续追问。";
 const DEFAULT_LIVE_MONITOR = "实时监控直播是否出现违禁词、粗口、擦边、抽烟、暴力、危险行为等风险；只有命中风险时保留证据。";
 
 const nodeLabels: Record<string, string> = {
@@ -217,7 +236,7 @@ export function App() {
   const [chat, setChat] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      text: "选择上传本地视频，或切到直播 URL。视频会先在后台解析，然后你可以连续提问；直播会先问你要监控什么，再开始实时扫描。"
+      text: "上传视频或粘贴视频 URL 后，我会自动总结当前视频内容，列出高光片段，并给出可继续追问的问题。"
     }
   ]);
   const [input, setInput] = useState("");
@@ -237,13 +256,14 @@ export function App() {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const pendingVideoQuestionsRef = useRef<PendingVideoQuestion[]>([]);
   const useWebSearchRef = useRef(false);
+  const overviewShownRef = useRef<Set<string>>(new Set());
 
   const sourceVideoUrl = job ? `/api/jobs/${job.job_id}/source` : null;
   const status = useMemo(() => statusText(job, liveSession, composerMode, pendingLive), [job, liveSession, composerMode, pendingLive]);
   const progress = job?.progress ?? (liveSession ? 100 : 0);
-  const mediaTitle = liveSession ? "直播监控" : job ? "视频解析" : pendingLive ? "等待监控目标" : "等待媒体";
-  const mediaSubtitle = liveSession?.source_url || pendingLive?.url || (job ? "视频正在后台解析，可先输入问题。" : "上方会播放视频；直播接入后显示实时状态。");
   const hasRunningTask = job?.status === "queued" || job?.status === "running" || liveSession?.status === "queued" || liveSession?.status === "running" || liveSession?.status === "streaming";
+  const mediaTitle = liveSession ? "直播监控" : job ? "视频解析" : pendingLive ? "等待监控目标" : "等待媒体";
+  const mediaSubtitle = liveSession?.source_url || pendingLive?.url || (job ? "后台解析中，完成后会自动总结。" : "上传视频、粘贴视频 URL，或切到直播监控。");
 
   useEffect(() => {
     return () => {
@@ -255,7 +275,7 @@ export function App() {
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [chat, result?.answer?.direct_answer, liveSession?.live_model?.stable_summary, liveSession?.segments.length]);
+  }, [chat, liveSession?.live_model?.stable_summary, liveSession?.segments.length]);
 
   useEffect(() => {
     useWebSearchRef.current = useWebSearch;
@@ -288,7 +308,7 @@ export function App() {
     resetLiveState();
     setChat([
       { role: "user", text: `上传本地视频：${file.name}` },
-      { role: "assistant", text: "收到，我会先在后台解析音频和关键画面。你现在可以直接问这个视频的问题。" }
+      { role: "assistant", text: "收到，我会先解析音频和关键画面；完成后会自动给出总结、高光片段和推荐问题。现在也可以继续输入你的问题。" }
     ]);
     setSubmitting(true);
     try {
@@ -323,7 +343,7 @@ export function App() {
         setChat((items) => [
           ...items,
           { role: "user", text },
-          { role: "assistant", text: "先上传本地视频，或直接发一个视频网页/直链 URL；解析完成后我会按你的问题回答。" }
+          { role: "assistant", text: "先上传本地视频，或直接粘贴一个视频 URL。视频解析完成后，我会自动总结并回答后续问题。" }
         ]);
         return;
       }
@@ -335,7 +355,7 @@ export function App() {
       setChat((items) => [
         ...items,
         { role: "user", text },
-        { role: "assistant", text: "我先记下这个问题。后台解析完成后，我会基于完整音频和关键画面来回答。" }
+        { role: "assistant", text: "我先记下这个问题。后台解析完成后，会先给默认总结，再继续回答你刚才的问题。" }
       ]);
       return;
     }
@@ -352,7 +372,7 @@ export function App() {
         setChat((items) => [
           ...items,
           { role: "user", text },
-          { role: "assistant", text: "先发我直播 URL。接入后我会让你确认要监控什么。" }
+          { role: "assistant", text: "请先粘贴直播 URL。接入后，我会让你确认需要监控什么。" }
         ]);
         return;
       }
@@ -379,7 +399,7 @@ export function App() {
     resetLiveState();
     setChat([
       { role: "user", text: `解析视频 URL：${trimmed}` },
-      { role: "assistant", text: "收到，我会先下载并解析这个视频。解析过程中也可以直接继续提问。" }
+      { role: "assistant", text: "收到，我会下载并解析这个视频；完成后会自动总结当前视频内容。" }
     ]);
     setSubmitting(true);
     try {
@@ -505,15 +525,14 @@ export function App() {
         if (response.ok) {
           const payload = (await response.json()) as Result;
           setResult(payload);
+          appendOverviewMessage(payload);
           const queuedQuestions = [...pendingVideoQuestionsRef.current];
           clearPendingVideoQuestions();
           if (queuedQuestions.length > 0) {
-            appendMessage({ role: "assistant", text: `后台解析完成。我现在回答刚才记下的 ${queuedQuestions.length} 个问题。` });
+            appendMessage({ role: "assistant", text: `我继续回答刚才记下的 ${queuedQuestions.length} 个问题。` });
             for (const queuedQuestion of queuedQuestions) {
               await answerVideoQuestion(nextJob.job_id, queuedQuestion.text, queuedQuestion.useWebSearch);
             }
-          } else {
-            appendMessage({ role: "assistant", text: "后台解析完成。你可以继续问更具体的问题，我会尽量按你的问题来分析。" });
           }
         }
       }
@@ -532,6 +551,20 @@ export function App() {
       setError(message);
       appendMessage({ role: "assistant", text: message });
     };
+  }
+
+  function appendOverviewMessage(payload: Result) {
+    const key = payload.job_id || job?.job_id || "current";
+    if (overviewShownRef.current.has(key)) return;
+    overviewShownRef.current.add(key);
+    setChat((items) => [
+      ...items,
+      {
+        role: "assistant",
+        kind: "overview",
+        overview: payload.ai_overview || overviewFromResult(payload)
+      }
+    ]);
   }
 
   function startPartialPolling(jobId: string) {
@@ -601,116 +634,185 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <section className="workspace-shell">
-        <header className="topbar">
+      <input ref={fileInputRef} type="file" accept="video/*" hidden onChange={(event) => void handleVideoSelected(event.target.files?.[0] ?? null)} />
+
+      <section className="media-pane">
+        <div className="media-toolbar">
+          <div className="brand-lockup">
+            <span className="brand-mark"><Sparkles size={18} /></span>
+            <div>
+              <strong>Audio-First AI</strong>
+              <small>{status}</small>
+            </div>
+          </div>
+          <div className="mode-switch" aria-label="模式切换">
+            <button type="button" className={composerMode === "video" ? "active" : ""} onClick={() => setComposerMode("video")}>
+              <Video size={15} /> 视频
+            </button>
+            <button
+              type="button"
+              className={composerMode === "live" ? "active" : ""}
+              onClick={() => {
+                setComposerMode("live");
+                resetVideoState();
+              }}
+            >
+              <Radio size={15} /> 直播
+            </button>
+          </div>
+        </div>
+
+        <div className="player-shell">
+          {sourceVideoUrl ? (
+            <video key={`${sourceVideoUrl}-${job?.status}`} ref={sourceVideoRef} className="source-video" src={sourceVideoUrl} controls preload="metadata" />
+          ) : liveSession ? (
+            <LiveStage session={liveSession} />
+          ) : pendingLive ? (
+            <EmptyStage icon={<Radio size={36} />} title="直播 URL 已收到" subtitle="在右侧输入要监控的内容后开始扫描。" />
+          ) : (
+            <EmptyStage icon={<Play size={38} />} title="等待视频或直播" subtitle="右侧可以上传本地视频、粘贴视频 URL，或进入直播监控。" />
+          )}
+        </div>
+
+        <div className="media-footer">
           <div>
-            <p className="eyebrow">Audio-first multimodal agent</p>
-            <h1>视频/直播问答工作台</h1>
+            <strong>{mediaTitle}</strong>
+            <span>{mediaSubtitle}</span>
           </div>
-          <div className="status-pill" title="当前状态">
-            {hasRunningTask || submitting || asking || liveSubmitting ? <Loader2 className="spin" size={16} /> : <Activity size={16} />}
-            <span>{status}</span>
+          <div className="mini-progress" aria-label="分析进度">
+            <span>{job ? `${job.progress}%` : liveSession ? liveStatusLabel(liveSession.status) : pendingLive ? "待确认" : "待开始"}</span>
+            <div><i style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} /></div>
           </div>
+        </div>
+      </section>
+
+      <aside className="ask-panel">
+        <header className="ask-tabs">
+          <button type="button">详情</button>
+          <button type="button">评论</button>
+          <button type="button" className="active">问AI</button>
         </header>
 
-        <section className="player-panel">
-          <div className="player-frame">
-            {sourceVideoUrl ? (
-              <video key={`${sourceVideoUrl}-${job?.status}`} ref={sourceVideoRef} className="source-video" src={sourceVideoUrl} controls preload="metadata" />
-            ) : liveSession ? (
-              <LiveStage session={liveSession} />
-            ) : pendingLive ? (
-              <EmptyStage icon={<Radio size={32} />} title="直播 URL 已收到" subtitle="请在下面输入要监控的目标，之后才会开始扫描。" />
-            ) : (
-              <EmptyStage icon={<Play size={32} />} title="等待视频或直播" subtitle="上传本地视频，或切到直播 URL 开始。" />
-            )}
-          </div>
-          <div className="media-meta">
-            <div>
-              <strong>{mediaTitle}</strong>
-              <span>{mediaSubtitle}</span>
-            </div>
-            <div className="mini-progress" aria-label="分析进度">
-              <span>{job ? `${job.progress}%` : liveSession ? liveStatusLabel(liveSession.status) : pendingLive ? "待确认" : "待开始"}</span>
-              <div><i style={{ width: `${Math.max(0, Math.min(100, progress))}%` }} /></div>
-            </div>
-          </div>
+        <div className="quick-actions">
+          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={submitting || liveSubmitting}>
+            <UploadCloud size={16} /> 上传本地视频
+          </button>
+          <button
+            type="button"
+            className={useWebSearch ? "active" : ""}
+            onClick={() => setUseWebSearch((value) => !value)}
+            aria-pressed={useWebSearch}
+            title="回答视频问题时结合联网搜索"
+          >
+            <Globe2 size={16} /> {useWebSearch ? "联网开启" : "仅视频库"}
+          </button>
+          {liveSession && ["queued", "running", "streaming"].includes(liveSession.status) && (
+            <button type="button" className="danger" onClick={() => void stopLive()}>
+              <Square size={14} /> 停止直播
+            </button>
+          )}
+        </div>
+
+        <div className="error-slot">
           {(error || liveError) && (
             <div className="error-line" role="alert">
               <AlertCircle size={16} />
               <span>{error || liveError}</span>
             </div>
           )}
-        </section>
+        </div>
 
-        <section className="conversation-panel">
-          <div className="chat-list" aria-live="polite">
-            {chat.map((message, index) => (
-              <article className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
-                <p>{renderTimeLinkedText(message.text, seekSourceVideo)}</p>
-                {message.meta && <small>{message.meta}</small>}
-              </article>
-            ))}
-            {liveSession?.live_model && <LiveModelMessage session={liveSession} />}
-            {(asking || submitting || liveSubmitting) && <ThinkingMessage label={thinkingLabel(asking, submitting, liveSubmitting, useWebSearch)} />}
-            <div ref={chatEndRef} />
+        <div className="chat-list" aria-live="polite">
+          {chat.map((message, index) => (
+            <ChatBubble
+              key={`${message.role}-${message.kind ?? "text"}-${index}`}
+              message={message}
+              onSeek={seekSourceVideo}
+              onAsk={(question) => void handleVideoComposer(question)}
+            />
+          ))}
+          {liveSession?.live_model && <LiveModelMessage session={liveSession} />}
+          {(asking || submitting || liveSubmitting || hasRunningTask) && (
+            <ThinkingMessage label={thinkingLabel(asking, submitting, liveSubmitting, hasRunningTask, useWebSearch)} />
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        <form className="composer" onSubmit={handleComposerSubmit}>
+          <div className="composer-row">
+            <Bot size={18} />
+            <input
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              placeholder={composerPlaceholder(composerMode, Boolean(job || result), Boolean(pendingLive), Boolean(liveSession), pendingVideoQuestions.length)}
+            />
+            <button type="submit" disabled={asking || submitting || liveSubmitting || !input.trim()} aria-label="发送">
+              {asking || submitting || liveSubmitting ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+            </button>
           </div>
-
-          <form className="composer" onSubmit={handleComposerSubmit}>
-            <input ref={fileInputRef} type="file" accept="video/*" hidden onChange={(event) => void handleVideoSelected(event.target.files?.[0] ?? null)} />
-            <div className="composer-tools" role="tablist" aria-label="输入来源">
-              <button
-                type="button"
-                className={composerMode === "video" ? "active" : ""}
-                onClick={() => {
-                  setComposerMode("video");
-                  setPendingLive(null);
-                }}
-              >
-                <Video size={16} /> 视频问答
-              </button>
-              <button
-                type="button"
-                className={composerMode === "live" ? "active" : ""}
-                onClick={() => {
-                  setComposerMode("live");
-                  resetVideoState();
-                }}
-              >
-                <Radio size={16} /> 直播监控
-              </button>
-              <button type="button" onClick={() => fileInputRef.current?.click()} disabled={submitting || liveSubmitting}>
-                <UploadCloud size={16} /> 上传本地视频
-              </button>
-              <button
-                type="button"
-                className={`web-tool ${useWebSearch ? "active" : ""}`}
-                onClick={() => setUseWebSearch((value) => !value)}
-                aria-pressed={useWebSearch}
-                title="回答视频问题时结合联网搜索"
-              >
-                <Globe2 size={16} /> {useWebSearch ? "联网增强" : "仅视频库"}
-              </button>
-              {liveSession && ["queued", "running", "streaming"].includes(liveSession.status) && (
-                <button type="button" className="danger-tool" onClick={() => void stopLive()}>
-                  <Square size={14} /> 停止直播
-                </button>
-              )}
-            </div>
-            <div className="composer-row">
-              <input
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                placeholder={composerPlaceholder(composerMode, Boolean(job || result), Boolean(pendingLive), Boolean(liveSession), pendingVideoQuestions.length)}
-              />
-              <button type="submit" disabled={asking || submitting || liveSubmitting || !input.trim()} aria-label="发送">
-                {asking || submitting || liveSubmitting ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
-              </button>
-            </div>
-          </form>
-        </section>
-      </section>
+        </form>
+      </aside>
     </main>
+  );
+}
+
+function ChatBubble({ message, onSeek, onAsk }: { message: ChatMessage; onSeek: (seconds: number) => void; onAsk: (question: string) => void }) {
+  if (message.kind === "overview" && message.overview) {
+    return (
+      <article className="chat-message assistant overview-message">
+        <OverviewCard overview={message.overview} onSeek={onSeek} onAsk={onAsk} />
+      </article>
+    );
+  }
+  return (
+    <article className={`chat-message ${message.role}`}>
+      <p>{renderTimeLinkedText(message.text || "", onSeek)}</p>
+      {message.meta && <small>{message.meta}</small>}
+    </article>
+  );
+}
+
+function OverviewCard({ overview, onSeek, onAsk }: { overview: AiOverview; onSeek: (seconds: number) => void; onAsk: (question: string) => void }) {
+  const highlights = overview.highlights ?? [];
+  const questions = overview.suggested_questions ?? [];
+  const bullets = overview.bullets ?? [];
+  return (
+    <div className="overview-card">
+      <div className="overview-title">
+        <span><Sparkles size={15} /></span>
+        <strong>总结当前视频内容</strong>
+      </div>
+      <p>{renderTimeLinkedText(overview.summary, onSeek)}</p>
+      {bullets.length > 0 && (
+        <ul className="overview-bullets">
+          {bullets.map((item) => <li key={item}>{renderTimeLinkedText(item, onSeek)}</li>)}
+        </ul>
+      )}
+      {highlights.length > 0 && (
+        <div className="highlights">
+          <h2>高光片段</h2>
+          {highlights.map((item) => (
+            <button type="button" className="highlight-row" key={`${item.time}-${item.label}`} onClick={() => onSeek(item.time)}>
+              <time>{item.time_label || formatTime(item.time)}</time>
+              <span>
+                <strong>{item.label || "关键片段"}</strong>
+                {item.detail && <small>{item.detail}</small>}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+      {questions.length > 0 && (
+        <div className="suggested-questions">
+          {questions.map((question) => (
+            <button type="button" key={question} onClick={() => onAsk(question)}>
+              <Sparkles size={13} /> {question}
+            </button>
+          ))}
+        </div>
+      )}
+      <small className="overview-note">以上总结由本地视频解析结果生成，时间点可点击跳转。</small>
+    </div>
   );
 }
 
@@ -792,7 +894,7 @@ function composerPlaceholder(mode: ComposerMode, hasVideoContext: boolean, hasPe
     return "粘贴直播 URL";
   }
   if (pendingQuestionCount > 0) return `已记下 ${pendingQuestionCount} 个问题，还可以继续补充`;
-  if (hasVideoContext) return "问这个视频一个问题，例如：详细总结一下升级点";
+  if (hasVideoContext) return "问这个视频一个问题，例如：推荐买哪一代？";
   return "粘贴视频 URL，或点击上传本地视频";
 }
 
@@ -817,10 +919,11 @@ function riskLevelLabel(level?: string) {
   return "无";
 }
 
-function thinkingLabel(asking: boolean, submitting: boolean, liveSubmitting: boolean, useWebSearch: boolean) {
+function thinkingLabel(asking: boolean, submitting: boolean, liveSubmitting: boolean, running: boolean, useWebSearch: boolean) {
   if (asking) return useWebSearch ? "正在结合视频知识库和联网资料思考" : "正在基于视频知识库思考";
   if (liveSubmitting) return "正在接入直播监控";
   if (submitting) return "正在创建解析任务";
+  if (running) return "正在解析视频，稍后自动总结";
   return "正在处理";
 }
 
@@ -868,12 +971,43 @@ function mergePartialResult(current: Result | null, next: Result) {
     ...current,
     ...next,
     answer: current.answer ?? next.answer,
+    ai_overview: next.ai_overview ?? current.ai_overview,
     timeline: next.timeline.length ? next.timeline : current.timeline,
     transcript_segments: next.transcript_segments?.length ? next.transcript_segments : current.transcript_segments,
     frames: next.frames.length ? next.frames : current.frames,
     prediction_checks: next.prediction_checks.length ? next.prediction_checks : current.prediction_checks,
     metadata: { ...current.metadata, ...next.metadata },
     transcription_status: next.transcription_status ?? current.transcription_status
+  };
+}
+
+function overviewFromResult(result: Result): AiOverview {
+  const summary = result.answer?.summary || result.answer?.direct_answer || "当前视频已完成解析，可以继续围绕内容提问。";
+  const highlights: AiHighlight[] = [];
+  for (const item of result.timeline.slice(0, 4)) {
+    highlights.push({
+      time: item.time,
+      time_label: formatTime(item.time),
+      label: item.label || "音频片段",
+      detail: item.evidence
+    });
+  }
+  for (const frame of result.frames.slice(0, 4)) {
+    if (highlights.some((item) => Math.abs(item.time - frame.time) < 8)) continue;
+    highlights.push({
+      time: frame.time,
+      time_label: formatTime(frame.time),
+      label: "关键画面",
+      detail: frame.observation?.scene || frame.reason,
+      url: frame.url
+    });
+    if (highlights.length >= 5) break;
+  }
+  return {
+    summary,
+    bullets: result.answer?.sections?.flatMap((section) => section.items.slice(0, 2)).slice(0, 4) ?? [],
+    highlights,
+    suggested_questions: ["总结当前视频内容", "高光片段分别在讲什么？", "按时间线详细讲一遍", "这条视频的核心结论是什么？"]
   };
 }
 

@@ -1462,6 +1462,214 @@ class AIClient:
         }
 
     @staticmethod
+    def build_ai_overview(result: dict[str, Any]) -> dict[str, Any]:
+        answer = result.get("answer") or {}
+        direct = str(answer.get("direct_answer") or "").strip()
+        summary = str(answer.get("summary") or direct).strip()
+        if not summary:
+            summary = AIClient._generic_detailed_followup_answer(result)
+        bullets = AIClient._overview_bullets(answer, result)
+        highlights = AIClient._overview_highlights(result)
+        suggested_questions = AIClient._overview_suggested_questions(result)
+        return {
+            "summary": AIClient._compress_text(summary or "当前视频已完成解析，可以继续围绕内容提问。", 760),
+            "bullets": bullets[:4],
+            "highlights": highlights[:5],
+            "suggested_questions": suggested_questions[:5],
+        }
+
+    @staticmethod
+    def _overview_bullets(answer: dict[str, Any], result: dict[str, Any]) -> list[str]:
+        bullets: list[str] = []
+        for section in answer.get("sections") or []:
+            title = str(section.get("title") or "").strip()
+            for item in section.get("items") or []:
+                text = str(item).strip()
+                if not text:
+                    continue
+                prefix = f"{title}：" if title else ""
+                bullets.append(AIClient._compress_text(prefix + text, 128))
+                if len(bullets) >= 4:
+                    return bullets
+        direct = str(answer.get("direct_answer") or "").strip()
+        if direct:
+            bullets.append(AIClient._compress_text(direct, 128))
+        world_summary = str((result.get("audio_world_model") or {}).get("summary") or "").strip()
+        if world_summary:
+            bullets.append(AIClient._compress_text(world_summary, 128))
+        return AIClient._dedupe_strings(bullets)[:4]
+
+    @staticmethod
+    def _overview_highlights(result: dict[str, Any]) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        answer = result.get("answer") or {}
+        for section in answer.get("sections") or []:
+            for item in section.get("items") or []:
+                text = str(item or "")
+                time_value = AIClient._first_time_in_text(text)
+                if time_value is not None:
+                    candidates.append(
+                        {
+                            "time": time_value,
+                            "label": AIClient._label_from_text(text),
+                            "detail": AIClient._strip_leading_time(text),
+                            "source": "answer",
+                            "score": 90,
+                        }
+                    )
+        for item in result.get("timeline") or []:
+            text = AIClient._clean_asr_text(str(item.get("evidence") or item.get("label") or ""))
+            label = str(item.get("label") or "").strip()
+            combined = " ".join([label, text])
+            if AIClient._is_noisy_text(text, combined):
+                continue
+            candidates.append(
+                {
+                    "time": float(item.get("time") or 0.0),
+                    "label": AIClient._label_from_text(label or text),
+                    "detail": AIClient._compress_text(text or label, 96),
+                    "source": "audio",
+                    "score": AIClient._highlight_score(combined),
+                }
+            )
+        for frame in result.get("frames") or []:
+            observation = frame.get("observation") or {}
+            text = " ".join(
+                str(value or "")
+                for value in (
+                    observation.get("scene"),
+                    observation.get("evidence_assessment"),
+                    " ".join(observation.get("visible_text") or []),
+                )
+            ).strip()
+            if not text:
+                continue
+            candidates.append(
+                {
+                    "time": float(frame.get("time") or 0.0),
+                    "label": AIClient._label_from_text(text),
+                    "detail": AIClient._clean_followup_context(AIClient._compress_text(text, 110)),
+                    "source": "visual",
+                    "url": frame.get("url"),
+                    "filename": frame.get("filename"),
+                    "score": AIClient._highlight_score(text) + 6,
+                }
+            )
+        for segment in result.get("transcript_segments") or []:
+            text = AIClient._clean_asr_text(str(segment.get("text") or ""))
+            if AIClient._is_noisy_text(text, text):
+                continue
+            candidates.append(
+                {
+                    "time": float(segment.get("start") or 0.0),
+                    "label": AIClient._label_from_text(text),
+                    "detail": AIClient._compress_text(text, 92),
+                    "source": "transcript",
+                    "score": AIClient._highlight_score(text) - 4,
+                }
+            )
+        deduped: list[dict[str, Any]] = []
+        for item in sorted(candidates, key=lambda value: (-int(value.get("score") or 0), float(value.get("time") or 0.0))):
+            time_value = float(item.get("time") or 0.0)
+            if any(abs(time_value - float(existing.get("time") or 0.0)) < 12 for existing in deduped):
+                continue
+            item = {key: value for key, value in item.items() if key != "score"}
+            item["time_label"] = AIClient._format_seconds(time_value)
+            deduped.append(item)
+            if len(deduped) >= 5:
+                break
+        return sorted(deduped, key=lambda value: float(value.get("time") or 0.0))
+
+    @staticmethod
+    def _overview_suggested_questions(result: dict[str, Any]) -> list[str]:
+        text = AIClient._result_text_context(result)
+        questions: list[str] = ["总结当前视频内容", "高光片段分别在讲什么？"]
+        if any(token.lower() in text.lower() for token in ("pocket", "dji", "大疆", "长焦", "画质", "动态范围", "iso", "发热", "稳定")):
+            questions.extend(
+                [
+                    "相比上一代有哪些升级？",
+                    "推荐买哪一代？",
+                    "画质、长焦和稳定性分别怎么样？",
+                    "如果和竞品对比，应该怎么选？",
+                ]
+            )
+        elif any(token in text for token in ("3D", "打印", "装修", "施工", "材料", "成本", "家具")):
+            questions.extend(
+                [
+                    "这个项目的主要难点是什么？",
+                    "成本和材料是怎么说的？",
+                    "最终效果怎么样？",
+                    "哪些片段最值得看？",
+                ]
+            )
+        elif any(token in text for token in ("教程", "步骤", "安装", "演示", "方法")):
+            questions.extend(["按步骤梳理一下流程", "最关键的操作点是什么？", "有哪些容易出错的地方？"])
+        else:
+            questions.extend(["这条视频的核心结论是什么？", "按时间线详细讲一遍", "有哪些值得继续追问的细节？"])
+        return AIClient._dedupe_strings(questions)[:5]
+
+    @staticmethod
+    def _highlight_score(text: str) -> int:
+        score = 20
+        keyword_weights = {
+            "结论": 18,
+            "总结": 15,
+            "核心": 14,
+            "值得": 14,
+            "升级": 14,
+            "画质": 13,
+            "动态范围": 13,
+            "长焦": 12,
+            "发热": 8,
+            "稳定": 8,
+            "成本": 12,
+            "价格": 10,
+            "设计": 8,
+            "施工": 8,
+            "成品": 10,
+            "效果": 9,
+            "样片": 11,
+            "测试": 9,
+        }
+        for keyword, weight in keyword_weights.items():
+            if keyword.lower() in text.lower() or keyword in text:
+                score += weight
+        return score
+
+    @staticmethod
+    def _label_from_text(text: str) -> str:
+        cleaned = AIClient._strip_leading_time(AIClient._clean_followup_context(text))
+        if "：" in cleaned:
+            head = cleaned.split("：", 1)[0]
+            if 2 <= len(head) <= 18:
+                return head
+        for keyword in ("画质", "动态范围", "长焦", "发热", "稳定", "外观", "成本", "设计", "施工", "成品", "结论", "样片", "材料"):
+            if keyword in cleaned:
+                return f"{keyword}片段"
+        return AIClient._compress_text(cleaned or "关键片段", 18)
+
+    @staticmethod
+    def _strip_leading_time(text: str) -> str:
+        import re
+
+        return re.sub(r"^\s*\d{1,2}:\d{2}(?::\d{2})?\s*[-~—–至到]*\s*(?:\d{1,2}:\d{2})?\s*[：:，,\s]*", "", str(text or "")).strip()
+
+    @staticmethod
+    def _dedupe_strings(items: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            clean = " ".join(str(item or "").split()).strip()
+            if not clean:
+                continue
+            signature = clean.lower()
+            if signature in seen:
+                continue
+            seen.add(signature)
+            deduped.append(clean)
+        return deduped
+
+    @staticmethod
     def _clean_fast_events(timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
         events = []
         for item in timeline:

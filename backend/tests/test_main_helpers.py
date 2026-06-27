@@ -11,6 +11,7 @@ from app.main import (
     _video_page_url_candidates,
     _web_search_queries,
 )
+from app.ai import AIClient
 
 
 def test_media_response_detection_accepts_direct_video_urls():
@@ -54,6 +55,33 @@ def test_state_to_partial_merges_observed_frames():
     assert partial["partial"] is True
     assert partial["frames"][0]["observation"]["scene"] == "A machine is visible."
     assert partial["timeline"][0]["label"] == "cue"
+    assert partial["ai_overview"]["suggested_questions"]
+
+
+def test_ai_overview_adds_summary_highlights_and_recommended_questions():
+    result = {
+        "answer": {
+            "direct_answer": "这是一期 Pocket 4P 评测视频，核心是长焦、画质和动态范围。",
+            "summary": "视频围绕 Pocket 4P 是否值得升级展开，重点看长焦、动态范围、发热和稳定体验。",
+            "sections": [
+                {"title": "内容脉络", "items": ["0:14：介绍等效 60mm 长焦。", "7:55：测试 ISO1600 动态范围。"]},
+                {"title": "关键结论", "items": ["重画质和长焦可以买 Pocket 4P。"]},
+            ],
+        },
+        "timeline": [
+            {"time": 14.0, "label": "长焦", "evidence": "等效60毫米长焦"},
+            {"time": 475.0, "label": "动态范围", "evidence": "ISO1600 动态范围最好"},
+        ],
+        "transcript_segments": [{"start": 14.0, "end": 16.0, "text": "等效60毫米长焦"}],
+        "frames": [],
+        "audio_world_model": {"summary": "产品评测"},
+    }
+
+    overview = AIClient.build_ai_overview(result)
+
+    assert "Pocket 4P" in overview["summary"]
+    assert any(item["time_label"] == "0:14" for item in overview["highlights"])
+    assert "相比上一代有哪些升级？" in overview["suggested_questions"]
 
 
 def test_followup_probe_times_selects_relevant_video_moments():
